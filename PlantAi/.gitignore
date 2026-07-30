@@ -1,0 +1,66 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+
+.gradle-home
+.gradle-user
+.gradle-user-home/
+.gradle-home-codex-verify
+
+# ===== Android / Gradle / Jetpack Compose =====
+# Built APKs, AABs, and other generated artifacts
+*.apk
+*.ap_
+*.aab
+*.aar
+*.dex
+
+# Gradle build output
+/build/
+**/build/
+.gradle/
+
+# Local configuration (SDK path, etc.)
+local.properties
+
+# Native build output
+.externalNativeBuild/
+.cxx/
+
+# Logs
+*.log
+
+# ===== Kotlin =====
+# Kotlin compiler output / caches
+.kotlin/
+
+# ===== IntelliJ / Android Studio / JetBrains =====
+.idea/
+*.iws
+/out/
+
+# Keep the wrapper JAR committed (recommended)
+!gradle/wrapper/gradle-wrapper.jar
+
+# ===== OS files =====
+Thumbs.db
+
+# ===== Lint / Reports =====
+**/lint-results*.xml
+**/lint-results*.html
+**/lint-results*.sarif
+
+# ===== Keystores (never commit) =====
+*.jks
+*.keystore

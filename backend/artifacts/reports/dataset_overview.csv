@@ -1,0 +1,7 @@
+Dataset,Role,~Images,Setting,Classes,Offers,Lacks
+PlantVillage,Lab baseline (A + B),70k train,Controlled lab,All 38,"Full label space, huge volume, ~96% lab acc",Real-world backgrounds; causes domain gap on PlantDoc
+PlantDoc,Field train + benchmark test,2.5k,Real field photos,27 of 38 in test,Only honest real-world test set you have,11 classes have zero test images; small vs PlantVillage
+PlantWild v2,Model B field boost,11k+,Crowdsourced wild,Partial map to 38,"Wild images for gaps (black rot, HLB, esca, etc.)",Noisy labels; needs harmonization
+Tomato Multiple Sources,Model B tomato boost,25k,Lab + some wild,10 tomato + healthy,"Mosaic, mites, target spot + foliar depth",Tomato only
+PlantCity (Kaggle Input),Model B field boost,52k capped,"Pakistan field, smartphone",52 (12 crops),Best PlantDoc-style field data — mount as Input (NOT downloaded to /working),Add codewithsk/plantcity... in notebook Data tab
+Removed (duplicate/small),—,—,—,—,"Orange 1.6k, Pakistan tomato 7.2k, PlantWild v1 18k — covered by above",—

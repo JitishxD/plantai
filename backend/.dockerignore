@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.md
+.DS_Store
+notebooks/
+build/
+.agents/

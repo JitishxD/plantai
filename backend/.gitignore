@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.DS_Store
+build/
+
+# Kaggle/training checkpoints
+best_model_b_p*.keras
+best_model_b.keras
+model_a_*.keras

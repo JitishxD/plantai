@@ -1,0 +1,4 @@
+# Ignore phase checkpoints if copied here by mistake; deploy model + reports stay tracked
+best_model_b_p*.keras
+best_model_b.keras
+model_a_*.keras
