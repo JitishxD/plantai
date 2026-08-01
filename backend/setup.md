@@ -217,3 +217,50 @@ pip install -r requirements.txt
 # Restart the app
 pm2 restart plantai
 ```
+
+---
+
+## 9. Troubleshooting
+
+### TensorFlow startup warnings
+
+On startup you may see logs like:
+
+```
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+oneDNN custom operations are on…
+This TensorFlow binary is optimized to use available CPU instructions…
+```
+
+These are **not errors** — they are TensorFlow's internal info messages:
+
+| Message | Meaning |
+|---|---|
+| `absl::InitializeLog()` | TF logs to stderr before its own logging system initializes — cosmetic noise |
+| `oneDNN custom operations are on` | TF uses Intel's oneDNN library for faster CPU math — a good thing |
+| `optimized to use available CPU instructions (AVX2, AVX512F…)` | TF is leveraging your server's advanced CPU instructions — also good |
+| `rebuild TensorFlow with the appropriate compiler flags` | Informational — the pip package is fine as-is |
+
+> **Note:** You'll see two copies of each message because Gunicorn runs 2 workers, each loading TensorFlow independently.
+
+#### Silence them
+
+Set these environment variables before starting the process:
+
+```bash
+export TF_CPP_MIN_LOG_LEVEL=3
+export TF_ENABLE_ONEDNN_OPTS=0
+```
+
+- `TF_CPP_MIN_LOG_LEVEL=3` — suppresses INFO, WARNING, and ERROR level C++ logs from TensorFlow
+- `TF_ENABLE_ONEDNN_OPTS=0` — disables the oneDNN optimization startup notification
+
+To make these permanent across server reboots, add them to `~/.bashrc`:
+
+```bash
+echo 'export TF_CPP_MIN_LOG_LEVEL=3' >> ~/.bashrc
+echo 'export TF_ENABLE_ONEDNN_OPTS=0' >> ~/.bashrc
+source ~/.bashrc
+```
+
+They are also defined in `ecosystem.config.js` and set as defaults in `plant_disease/config.py`.

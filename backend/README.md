@@ -189,6 +189,15 @@ The YAML frontmatter at the top of this README is required for Spaces.
 
 Do **not** deploy `best_model_b_p1/p1b/p2/p3.keras` — those are training checkpoints.
 
+### Datasets used by Model B (`train_model_b_kaggle.ipynb`)
+
+| Dataset | Purpose in training | Link |
+|---------|---------------------|------|
+| PlantVillage (New Plant Diseases Dataset) | Core lab baseline across all 38 classes | https://www.kaggle.com/datasets/vipoooool/new-plant-diseases-dataset |
+| PlantDoc Dataset | Real-field train split + benchmark field test split | https://github.com/pratikkayal/PlantDoc-Dataset |
+| PlantCity: A Comprehensive Images Multicrop Leaves | Main extra field-domain boost (enabled via Kaggle Input in `auto` mode) | https://www.kaggle.com/datasets/codewithsk/plantcity-a-comprehensive-images-multicrop-leaves |
+| Tomato Disease Multiple Sources | Extra tomato-focused field/lab diversity for hard tomato confusions | https://www.kaggle.com/datasets/cookiefinder/tomato-disease-multiple-sources |
+
 See `artifacts/reports/LATEST_RUN_REPORT.md` for the latest field metrics and which file to use.
 
 Remedies in the API are general cultural-practice notes for demos — not a substitute for agricultural extension advice.
