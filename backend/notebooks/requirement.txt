@@ -1,0 +1,9 @@
+# use "tensorflow-cpu==2.21.0" if the VPS has no NVIDIA GPU
+tensorflow[and-cuda]==2.21.0
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+pillow
+kaggle
