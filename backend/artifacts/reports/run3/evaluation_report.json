@@ -1,0 +1,251 @@
+{
+  "backbone": "efficientnetv2b0",
+  "img_size": 256,
+  "num_classes": 38,
+  "scorable_classes": 27,
+  "pv_valid_acc": 0.9760414295470066,
+  "plantdoc": {
+    "acc": 0.6271186440677966,
+    "macro_f1_supported": 0.6225720574447784,
+    "weighted_f1": 0.624430570908571
+  },
+  "plantdoc_tta": {
+    "acc": 0.6101694915254238,
+    "macro_f1_supported": 0.6062445959676782,
+    "weighted_f1": 0.6088439356641331
+  },
+  "train_images": {
+    "lab": 80295,
+    "field": 16219
+  },
+  "per_class": [
+    {
+      "Class": "Apple___Apple_scab",
+      "PlantDoc support": 10,
+      "Field images": 1125,
+      "F1": 0.462
+    },
+    {
+      "Class": "Apple___Black_rot",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Apple___Cedar_apple_rust",
+      "PlantDoc support": 10,
+      "Field images": 65,
+      "F1": 0.818
+    },
+    {
+      "Class": "Apple___healthy",
+      "PlantDoc support": 9,
+      "Field images": 70,
+      "F1": 0.667
+    },
+    {
+      "Class": "Blueberry___healthy",
+      "PlantDoc support": 11,
+      "Field images": 88,
+      "F1": 0.471
+    },
+    {
+      "Class": "Cherry_(including_sour)___Powdery_mildew",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Cherry_(including_sour)___healthy",
+      "PlantDoc support": 10,
+      "Field images": 540,
+      "F1": 0.571
+    },
+    {
+      "Class": "Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot",
+      "PlantDoc support": 4,
+      "Field images": 581,
+      "F1": 0.308
+    },
+    {
+      "Class": "Corn_(maize)___Common_rust_",
+      "PlantDoc support": 10,
+      "Field images": 90,
+      "F1": 0.889
+    },
+    {
+      "Class": "Corn_(maize)___Northern_Leaf_Blight",
+      "PlantDoc support": 12,
+      "Field images": 160,
+      "F1": 0.571
+    },
+    {
+      "Class": "Corn_(maize)___healthy",
+      "PlantDoc support": 0,
+      "Field images": 568,
+      "F1": 0.0
+    },
+    {
+      "Class": "Grape___Black_rot",
+      "PlantDoc support": 8,
+      "Field images": 44,
+      "F1": 0.889
+    },
+    {
+      "Class": "Grape___Esca_(Black_Measles)",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Grape___Leaf_blight_(Isariopsis_Leaf_Spot)",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Grape___healthy",
+      "PlantDoc support": 12,
+      "Field images": 1533,
+      "F1": 0.917
+    },
+    {
+      "Class": "Orange___Haunglongbing_(Citrus_greening)",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Peach___Bacterial_spot",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Peach___healthy",
+      "PlantDoc support": 9,
+      "Field images": 80,
+      "F1": 0.875
+    },
+    {
+      "Class": "Pepper,_bell___Bacterial_spot",
+      "PlantDoc support": 9,
+      "Field images": 47,
+      "F1": 0.762
+    },
+    {
+      "Class": "Pepper,_bell___healthy",
+      "PlantDoc support": 8,
+      "Field images": 45,
+      "F1": 0.7
+    },
+    {
+      "Class": "Potato___Early_blight",
+      "PlantDoc support": 8,
+      "Field images": 83,
+      "F1": 0.4
+    },
+    {
+      "Class": "Potato___Late_blight",
+      "PlantDoc support": 8,
+      "Field images": 76,
+      "F1": 0.235
+    },
+    {
+      "Class": "Potato___healthy",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Raspberry___healthy",
+      "PlantDoc support": 7,
+      "Field images": 101,
+      "F1": 0.875
+    },
+    {
+      "Class": "Soybean___healthy",
+      "PlantDoc support": 8,
+      "Field images": 52,
+      "F1": 0.667
+    },
+    {
+      "Class": "Squash___Powdery_mildew",
+      "PlantDoc support": 6,
+      "Field images": 111,
+      "F1": 0.909
+    },
+    {
+      "Class": "Strawberry___Leaf_scorch",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Strawberry___healthy",
+      "PlantDoc support": 8,
+      "Field images": 66,
+      "F1": 0.941
+    },
+    {
+      "Class": "Tomato___Bacterial_spot",
+      "PlantDoc support": 9,
+      "Field images": 1390,
+      "F1": 0.111
+    },
+    {
+      "Class": "Tomato___Early_blight",
+      "PlantDoc support": 9,
+      "Field images": 1568,
+      "F1": 0.476
+    },
+    {
+      "Class": "Tomato___Late_blight",
+      "PlantDoc support": 10,
+      "Field images": 1189,
+      "F1": 0.316
+    },
+    {
+      "Class": "Tomato___Leaf_Mold",
+      "PlantDoc support": 6,
+      "Field images": 1573,
+      "F1": 0.375
+    },
+    {
+      "Class": "Tomato___Septoria_leaf_spot",
+      "PlantDoc support": 11,
+      "Field images": 1373,
+      "F1": 0.526
+    },
+    {
+      "Class": "Tomato___Spider_mites Two-spotted_spider_mite",
+      "PlantDoc support": 0,
+      "Field images": 510,
+      "F1": 0.0
+    },
+    {
+      "Class": "Tomato___Target_Spot",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
+      "PlantDoc support": 6,
+      "Field images": 1535,
+      "F1": 0.667
+    },
+    {
+      "Class": "Tomato___Tomato_mosaic_virus",
+      "PlantDoc support": 10,
+      "Field images": 33,
+      "F1": 0.4
+    },
+    {
+      "Class": "Tomato___healthy",
+      "PlantDoc support": 8,
+      "Field images": 1523,
+      "F1": 0.571
+    }
+  ]
+}
