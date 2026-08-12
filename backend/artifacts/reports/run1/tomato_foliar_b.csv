@@ -1,0 +1,6 @@
+,Tomato___Bacterial_spot,Tomato___Early_blight,Tomato___Late_blight,Tomato___Leaf_Mold,Tomato___Septoria_leaf_spot
+Tomato___Bacterial_spot,11,11,0,11,33
+Tomato___Early_blight,0,55,11,0,0
+Tomato___Late_blight,0,0,66,0,11
+Tomato___Leaf_Mold,11,0,11,22,0
+Tomato___Septoria_leaf_spot,11,11,0,0,99
