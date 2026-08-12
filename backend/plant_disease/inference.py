@@ -1,4 +1,4 @@
-"""Model load + image prediction (matches Kaggle Model B / EfficientNet training)."""
+"""Model load + image prediction (matches Kaggle Model B / EfficientNetV2-B0 training)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 def _get_preprocess(backbone: str):
     name = backbone.lower()
+    if name in {"efficientnetv2b0", "efficientnetv2-b0", "efficientnet_v2_b0"}:
+        return lambda x: x.astype(np.float32) if isinstance(x, np.ndarray) else x
     if name in {"efficientnetb0", "efficientnet", "efficientnet-b0"}:
         from tensorflow.keras.applications.efficientnet import preprocess_input
 
@@ -27,13 +29,31 @@ def _get_preprocess(backbone: str):
 
         return preprocess_input
     raise ValueError(
-        f"Unsupported BACKBONE={backbone!r}. Use 'efficientnetb0' (Model B) "
-        "or 'mobilenetv2'."
+        f"Unsupported BACKBONE={backbone!r}. Use 'efficientnetv2b0' (Model B), "
+        "'efficientnetb0', or 'mobilenetv2'."
     )
 
 
+def _center_square_crop(img: Image.Image) -> Image.Image:
+    """Center square crop matching the training notebook's _center_square / serve_image."""
+    w, h = img.size
+    s = min(w, h)
+    l = (w - s) // 2
+    t = (h - s) // 2
+    return img.crop((l, t, l + s, t + s))
+
+
+def _center_crop_pil(img: Image.Image, scale: float) -> Image.Image:
+    """Center crop at a given scale and resize back to original size (for TTA)."""
+    w, h = img.size
+    cw, ch = int(w * scale), int(h * scale)
+    l = (w - cw) // 2
+    t = (h - ch) // 2
+    return img.crop((l, t, l + cw, t + ch)).resize((w, h), Image.BILINEAR)
+
+
 class PlantDiseaseModel:
-    """Lazy-loaded Keras classifier with optional flip TTA."""
+    """Lazy-loaded Keras classifier with optional TTA."""
 
     def __init__(
         self,
@@ -97,8 +117,10 @@ class PlantDiseaseModel:
         logger.info("Model ready: %d classes", len(class_names))
 
     def _pil_to_batch(self, img: Image.Image) -> np.ndarray:
+        """Center square crop -> resize -> preprocess -> expand to batch dim."""
         assert self._preprocess is not None
-        rgb = img.convert("RGB").resize((config.IMG_SIZE, config.IMG_SIZE))
+        rgb = _center_square_crop(img.convert("RGB"))
+        rgb = rgb.resize((config.IMG_SIZE, config.IMG_SIZE), Image.BILINEAR)
         arr = np.asarray(rgb, dtype=np.float32)
         return self._preprocess(np.expand_dims(arr, axis=0))
 
@@ -127,9 +149,8 @@ class PlantDiseaseModel:
             views.extend([
                 img.transpose(Image.Transpose.FLIP_LEFT_RIGHT),
                 img.transpose(Image.Transpose.FLIP_TOP_BOTTOM),
-                img.transpose(Image.Transpose.FLIP_LEFT_RIGHT).transpose(
-                    Image.Transpose.FLIP_TOP_BOTTOM
-                ),
+                _center_crop_pil(img, 0.85),
+                _center_crop_pil(img, 0.90),
             ])
 
         probs = np.mean(

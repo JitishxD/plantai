@@ -61,8 +61,8 @@ Edit `.env` as needed. Key variables:
 |-------------------------|--------------------------------------|------------------------------------|
 | `MODEL_PATH`            | `artifacts/model_b_combined.keras`   | Path to the Keras model file       |
 | `CLASS_NAMES_PATH`      | `artifacts/class_names.json`         | Path to class names JSON           |
-| `BACKBONE`              | `efficientnetb0`                     | Must match training notebook       |
-| `IMG_SIZE`              | `224`                                | Input image size                   |
+| `BACKBONE`              | `efficientnetv2b0`                     | Must match training notebook       |
+| `IMG_SIZE`              | `256`                                | Input image size                   |
 | `USE_TTA`               | `true`                               | Enable test-time augmentation      |
 | `CONFIDENCE_THRESHOLD`  | `0.6`                                | Min confidence to return a result  |
 | `TOP_K`                 | `3`                                  | Number of top predictions          |

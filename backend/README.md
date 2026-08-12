@@ -1,23 +1,12 @@
 # Plant Disease Detector — Backend
 
-Flask API for **Model B** (`EfficientNetB0`, PlantVillage + field data).  
+Flask API for **Model B** (`EfficientNetV2-B0`, PlantVillage + field data).  
 Deploy file: `artifacts/model_b_combined.keras` + `artifacts/class_names.json`.
 
 
-## Setup
+## Setup & Deployment
 
-1. Clone the repo — **`artifacts/model_b_combined.keras`**, `class_names.json`, and evaluation reports under `artifacts/reports/` are included.
-2. Optional: copy `.env.example` → `.env` and edit.
-3. To retrain: run `notebooks/train_model_b_kaggle.ipynb` on Kaggle and replace `artifacts/` from `dsn_artifacts.zip` if needed.
-
-```bash
-cd backend
-pip install -r requirements.txt
-python wsgi.py
-# or: python -m plant_disease
-```
-
-Default local URL: `http://localhost:5000`
+See [setup.md](setup.md) for the complete setup, deployment (PM2 + Gunicorn), and reverse proxy guide.
 
 ---
 
@@ -47,8 +36,8 @@ Checks whether weights loaded.
   "classes": 38,
   "model_path": ".../artifacts/model_b_combined.keras",
   "class_names_path": ".../artifacts/class_names.json",
-  "backbone": "efficientnetb0",
-  "img_size": 224,
+  "backbone": "efficientnetv2b0",
+  "img_size": 256,
   "use_tta": true,
   "confidence_threshold": 0.6
 }
@@ -147,38 +136,8 @@ Invoke-RestMethod -Uri http://localhost:5000/predict -Method Post -Form @{
 
 `POST` multipart/`form-data`, field name **`image`**, response JSON as above.
 
----
 
-## Environment variables
 
-Loaded from `.env` (via `python-dotenv`) or the process environment.
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `MODEL_PATH` | `artifacts/model_b_combined.keras` | Deploy weights |
-| `CLASS_NAMES_PATH` | `artifacts/class_names.json` | Label list (order must match model) |
-| `BACKBONE` | `efficientnetb0` | Preprocess must match training |
-| `IMG_SIZE` | `224` | Input size |
-| `USE_TTA` | `true` | Average flip views at inference |
-| `CONFIDENCE_THRESHOLD` | `0.6` | Sets `low_confidence` |
-| `TOP_K` | `3` | How many scores in `top_k` |
-| `MAX_UPLOAD_MB` | `10` | Upload size limit |
-| `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `5000` local / `7860` Docker | HTTP port |
-
----
-
-## Docker / Hugging Face Spaces
-
-```bash
-docker build -t plant-backend .
-docker run -p 7860:7860 plant-backend
-```
-
-Upload this repo (including `artifacts/model_b_combined.keras`) to a **Docker** Space.  
-The YAML frontmatter at the top of this README is required for Spaces.
-
----
 
 ## Training
 
@@ -198,6 +157,5 @@ Do **not** deploy `best_model_b_p1/p1b/p2/p3.keras` — those are training check
 | PlantCity: A Comprehensive Images Multicrop Leaves | Main extra field-domain boost (enabled via Kaggle Input in `auto` mode) | https://www.kaggle.com/datasets/codewithsk/plantcity-a-comprehensive-images-multicrop-leaves |
 | Tomato Disease Multiple Sources | Extra tomato-focused field/lab diversity for hard tomato confusions | https://www.kaggle.com/datasets/cookiefinder/tomato-disease-multiple-sources |
 
-See `artifacts/reports/LATEST_RUN_REPORT.md` for the latest field metrics and which file to use.
 
-Remedies in the API are general cultural-practice notes for demos — not a substitute for agricultural extension advice.
+Note: Remedies in the API are general cultural-practice notes for demos — not a substitute for agricultural extension advice.
