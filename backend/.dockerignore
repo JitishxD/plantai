@@ -7,3 +7,6 @@ __pycache__/
 notebooks/
 build/
 .agents/
+venv/
+.env
+docker-compose.yml

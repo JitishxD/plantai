@@ -1,0 +1,22 @@
+services:
+  plantai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: plantai-backend
+    restart: unless-stopped
+
+    # Load all variables from .env into the container
+    env_file:
+      - .env
+
+    ports:
+      - "${PORT:-5001}:${PORT:-5001}"
+
+    # Health check against the /health endpoint
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5001}/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s # TF model loading can take a while
