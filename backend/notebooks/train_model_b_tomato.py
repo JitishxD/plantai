@@ -5,6 +5,7 @@ import time
 import shutil
 import hashlib
 import zipfile
+import subprocess
 from collections import defaultdict
 
 import numpy as np
@@ -28,24 +29,19 @@ DROPOUT = 0.3
 USE_EMA = True                     # Polyak averaging: free ~0.5-1 pt, smoother val loss
 USE_TTA = True                     # eval-time only
 FIELD_BALANCE_TEMP = 0.5           # 0 = all classes equally likely, 1 = natural counts
-HARD_CLASS_BOOST = 3.0              # extra sampling weight for weak classes
-HARD_FIELD_CLASSES = {               # classes with F1 < 0.4 in previous runs
-    'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot',
+HARD_CLASS_BOOST = 3.0             # extra sampling weight for weak classes
+HARD_FIELD_CLASSES = {             # tomato classes with F1 < 0.4 in previous runs
     'Tomato___Bacterial_spot',
     'Tomato___Leaf_Mold',
     'Tomato___Early_blight',
     'Tomato___Tomato_mosaic_virus',
-    'Soybean___healthy',
     'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
-    'Cherry_(including_sour)___healthy',
-    'Grape___Black_rot',
 }
 MAX_PER_SOURCE_FOLDER = 1500       # stop one huge folder from owning a class
 PD_VAL_FRACTION = 0.15             # PlantDoc hold-out used for early stopping
 FINETUNE_LAST_N = None             # None = whole backbone (BatchNorm always stays frozen)
 
 # Training schedule. field_mix = share of each batch drawn from real field photos.
-# No phase is 100% field: 11 classes have no field data and would be forgotten.
 PHASES = [
     dict(name='warmup',   epochs=4,  steps=500, lr=1e-3, field_mix=0.50, mixup=False,
          finetune=False, patience=3),
@@ -55,9 +51,26 @@ PHASES = [
          finetune=True,  patience=3),
 ]
 
-MODEL_PATH = f'{WORK}/model_b_combined.keras'
+MODEL_PATH = f'{WORK}/model_tomato.keras'
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp')
 AUTOTUNE = tf.data.AUTOTUNE
+
+# PlantVillage-aligned tomato taxonomy (10 classes). Powdery mildew in the Kaggle
+# tomato-disease dataset is intentionally skipped — it has no PlantVillage/PlantDoc label.
+TOMATO_CLASSES = [
+    'Tomato___Bacterial_spot',
+    'Tomato___Early_blight',
+    'Tomato___Late_blight',
+    'Tomato___Leaf_Mold',
+    'Tomato___Septoria_leaf_spot',
+    'Tomato___Spider_mites Two-spotted_spider_mite',
+    'Tomato___Target_Spot',
+    'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
+    'Tomato___Tomato_mosaic_virus',
+    'Tomato___healthy',
+]
+NUM_CLASSES = len(TOMATO_CLASSES)
+CLASS_INDEX = {c: i for i, c in enumerate(TOMATO_CLASSES)}
 
 keras.utils.set_random_seed(SEED)
 
@@ -71,6 +84,20 @@ assert BACKBONE in BACKBONES, f'unknown backbone {BACKBONE}'
 
 
 # ------------------------------------------------------------------ utils ---
+def run_cmd(cmd):
+    print('>', ' '.join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def kaggle_download(dataset, dest):
+    run_cmd(['kaggle', 'datasets', 'download', '-d', dataset, '-p', dest, '--unzip'])
+
+
+def git_clone(repo, dest):
+    shutil.rmtree(dest, ignore_errors=True)
+    run_cmd(['git', 'clone', '-q', repo, dest])
+
+
 def disk_free(label=''):
     free = shutil.disk_usage(WORK).free / 1e9
     print(f'Disk [{label}]: {free:.1f} GB free')
@@ -117,13 +144,9 @@ def image_files(folder):
 
 
 # ------------------------------------------------- label harmonisation -----
-# All source folder names are normalised through _key() before lookup, so casing,
-# underscores and filler words ("leaf", "images", ...) never matter.
 FILLER = {'leaf', 'leaves', 'plant', 'plants', 'image', 'images', 'photo', 'photos',
           'disease', 'diseased', 'dataset', 'class', 'train', 'folder'}
-PLANT_STOP = {'including', 'sour'}
-TOKEN_SYNONYMS = {'normal': 'healthy', 'fresh': 'healthy', 'soyabean': 'soybean',
-                  'soya': 'soybean', 'maize': 'corn', 'grey': 'gray', 'mould': 'mold'}
+TOKEN_SYNONYMS = {'normal': 'healthy', 'fresh': 'healthy', 'mould': 'mold'}
 
 
 def _key(text):
@@ -136,51 +159,34 @@ def _key(text):
     return ' '.join(kept or words)
 
 
-# PlantDoc folder names -> PlantVillage classes (its naming is too idiosyncratic to infer).
+# cookiefinder/tomato-disease-multiple-sources folder names -> PlantVillage classes.
+TOMATO_ALIASES = {
+    'Bacterial_spot': 'Tomato___Bacterial_spot',
+    'Early_blight': 'Tomato___Early_blight',
+    'Late_blight': 'Tomato___Late_blight',
+    'Leaf_Mold': 'Tomato___Leaf_Mold',
+    'Septoria_leaf_spot': 'Tomato___Septoria_leaf_spot',
+    'Spider_mites Two-spotted_spider_mite': 'Tomato___Spider_mites Two-spotted_spider_mite',
+    'Target_Spot': 'Tomato___Target_Spot',
+    'Tomato_Yellow_Leaf_Curl_Virus': 'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
+    'Tomato_mosaic_virus': 'Tomato___Tomato_mosaic_virus',
+    'healthy': 'Tomato___healthy',
+}
+
+# PlantDoc folder names -> tomato PlantVillage classes.
 PLANTDOC_ALIASES = {
-    'Apple Scab Leaf': 'Apple___Apple_scab', 'Apple leaf': 'Apple___healthy',
-    'Apple rust leaf': 'Apple___Cedar_apple_rust', 'Bell_pepper leaf': 'Pepper,_bell___healthy',
-    'Bell_pepper leaf spot': 'Pepper,_bell___Bacterial_spot', 'Blueberry leaf': 'Blueberry___healthy',
-    'Cherry leaf': 'Cherry_(including_sour)___healthy',
-    'Corn Gray leaf spot': 'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot',
-    'Corn leaf blight': 'Corn_(maize)___Northern_Leaf_Blight',
-    'Corn rust leaf': 'Corn_(maize)___Common_rust_', 'Corn leaf': 'Corn_(maize)___healthy',
-    'Peach leaf': 'Peach___healthy', 'Potato leaf early blight': 'Potato___Early_blight',
-    'Potato leaf late blight': 'Potato___Late_blight', 'Potato leaf': 'Potato___healthy',
-    'Raspberry leaf': 'Raspberry___healthy', 'Soyabean leaf': 'Soybean___healthy',
-    'Squash Powdery mildew leaf': 'Squash___Powdery_mildew', 'Strawberry leaf': 'Strawberry___healthy',
     'Tomato Early blight leaf': 'Tomato___Early_blight',
-    'Tomato Septoria leaf spot': 'Tomato___Septoria_leaf_spot', 'Tomato leaf': 'Tomato___healthy',
+    'Tomato Septoria leaf spot': 'Tomato___Septoria_leaf_spot',
+    'Tomato leaf': 'Tomato___healthy',
     'Tomato leaf bacterial spot': 'Tomato___Bacterial_spot',
     'Tomato leaf late blight': 'Tomato___Late_blight',
     'Tomato leaf mosaic virus': 'Tomato___Tomato_mosaic_virus',
     'Tomato leaf yellow virus': 'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
     'Tomato mold leaf': 'Tomato___Leaf_Mold',
     'Tomato two spotted spider mites leaf': 'Tomato___Spider_mites Two-spotted_spider_mite',
-    'grape leaf': 'Grape___healthy', 'grape leaf black rot': 'Grape___Black_rot',
 }
 
-TOMATO_ALIASES = {
-    'Bacterial_spot': 'Tomato___Bacterial_spot', 'Early_blight': 'Tomato___Early_blight',
-    'Late_blight': 'Tomato___Late_blight', 'Leaf_Mold': 'Tomato___Leaf_Mold',
-    'Septoria_leaf_spot': 'Tomato___Septoria_leaf_spot',
-    'Spider_mites Two-spotted_spider_mite': 'Tomato___Spider_mites Two-spotted_spider_mite',
-    'Target_Spot': 'Tomato___Target_Spot',
-    'Tomato_Yellow_Leaf_Curl_Virus': 'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
-    'Tomato_mosaic_virus': 'Tomato___Tomato_mosaic_virus', 'healthy': 'Tomato___healthy',
-}
-
-# Names the token matcher below cannot resolve (latin/common-name mismatches).
-GLOBAL_ALIASES = {
-    'corn gray leaf spot': 'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot',
-    'corn cercospora leaf spot': 'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot',
-    'grape esca': 'Grape___Esca_(Black_Measles)',
-    'grape black measles': 'Grape___Esca_(Black_Measles)',
-    'grape leaf blight': 'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)',
-    'grape isariopsis leaf spot': 'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)',
-    'orange huanglongbing': 'Orange___Haunglongbing_(Citrus_greening)',
-    'orange citrus greening': 'Orange___Haunglongbing_(Citrus_greening)',
-    'citrus greening': 'Orange___Haunglongbing_(Citrus_greening)',
+TOMATO_TOKEN_ALIASES = {
     'tomato spider mite': 'Tomato___Spider_mites Two-spotted_spider_mite',
     'tomato spider mites': 'Tomato___Spider_mites Two-spotted_spider_mite',
     'tomato two spotted spider mite': 'Tomato___Spider_mites Two-spotted_spider_mite',
@@ -189,15 +195,15 @@ GLOBAL_ALIASES = {
 
 def _pv_tokens(pv_class):
     plant, disease = pv_class.split('___', 1)
-    p = set(_key(plant).split()) - PLANT_STOP
+    p = set(_key(plant).split())
     d = set(_key(disease).split())
     return p, d
 
 
 def build_mapping(root, class_names, aliases=None, tag=''):
-    """folder name -> PlantVillage class. Every decision is written to a CSV for audit."""
+    """folder name -> tomato class. Every decision is written to a CSV for audit."""
     table = {_key(k): v for k, v in (aliases or {}).items()}
-    table.update({k: v for k, v in GLOBAL_ALIASES.items()})
+    table.update({k: v for k, v in TOMATO_TOKEN_ALIASES.items()})
     pv_tokens = {c: _pv_tokens(c) for c in class_names}
 
     mapping, rows = {}, []
@@ -211,7 +217,7 @@ def build_mapping(root, class_names, aliases=None, tag=''):
             best, best_score, tie = None, 0, False
             for pv, (p, d) in pv_tokens.items():
                 if not d or not (p & tokens):
-                    continue                      # crop must match, else 'late blight' floats free
+                    continue
                 overlap = len(d & tokens)
                 rest = tokens - p
                 if overlap == 0 or not (overlap >= len(d) - 1 or (rest and rest <= d)):
@@ -244,7 +250,7 @@ def collect(root, mapping, class_index, cap=MAX_PER_SOURCE_FOLDER,
     for folder, cls in sorted(mapping.items()):
         fdir = os.path.join(root, folder)
         files = image_files(fdir)
-        if cap and len(files) > cap:                      # deterministic subsample
+        if cap and len(files) > cap:
             files = sorted(files, key=lambda f: stable_bucket(folder + f, 10 ** 9))[:cap]
         for fname in files:
             path = os.path.join(fdir, fname)
@@ -280,9 +286,30 @@ def find_class_root(base, class_names, max_depth=3):
     return best
 
 
+def tomato_pv_mapping(pv_train_root):
+    """PlantVillage train folders that belong to the tomato taxonomy."""
+    available = {d for d in os.listdir(pv_train_root) if os.path.isdir(os.path.join(pv_train_root, d))}
+    missing = [c for c in TOMATO_CLASSES if c not in available]
+    if missing:
+        raise RuntimeError(f'PlantVillage is missing tomato classes: {missing}')
+    return {c: c for c in TOMATO_CLASSES}
+
+
 # ================================================== 1. locate the datasets ==
-print('=== 1. Datasets ===')
+print('=== 1. Datasets (tomato-only) ===')
 disk_free('start')
+
+TOMATO_DIR = find_input('tomato-disease-multiple', 'tomato-disease', must_contain=('train',))
+if TOMATO_DIR is None:
+    print('Tomato Disease Multiple Sources not mounted — downloading (needs internet + kaggle.json)...')
+    kaggle_download('cookiefinder/tomato-disease-multiple-sources', f'{WORK}/tomato')
+    TOMATO_DIR = find_input('tomato-disease-multiple', 'tomato-disease', must_contain=('train',)) or f'{WORK}/tomato'
+tom_root = os.path.join(TOMATO_DIR, 'train')
+if not os.path.isdir(tom_root):
+    tom_root = find_class_root(TOMATO_DIR, TOMATO_CLASSES)
+if not os.path.isdir(tom_root):
+    raise RuntimeError('Tomato Disease Multiple Sources train/ not found — mount '
+                       '"Tomato Disease Multiple Sources" as a Kaggle Input.')
 
 PV_TRAIN = PV_VALID = None
 pv_root = find_input('new-plant-diseases', 'plant-diseases', 'plantvillage')
@@ -296,7 +323,7 @@ for base in filter(None, [pv_root, f'{WORK}/data']):
         break
 if PV_TRAIN is None:
     print('PlantVillage not mounted — downloading (needs internet + kaggle.json)...')
-    !kaggle datasets download -d vipoooool/new-plant-diseases-dataset -p {WORK}/data --unzip
+    kaggle_download('vipoooool/new-plant-diseases-dataset', f'{WORK}/data')
     for root, dirs, _ in os.walk(f'{WORK}/data'):
         dirs.sort()
         if 'train' in dirs and 'valid' in dirs:
@@ -308,32 +335,30 @@ if not (PV_TRAIN and os.path.isdir(PV_TRAIN)):
 
 PD_DIR = find_input('plantdoc', must_contain=('train', 'test')) or f'{WORK}/plantdoc'
 if not os.path.isdir(os.path.join(PD_DIR, 'train')):
-    shutil.rmtree(PD_DIR, ignore_errors=True)
-    !git clone -q https://github.com/pratikkayal/PlantDoc-Dataset.git {PD_DIR}
+    git_clone('https://github.com/pratikkayal/PlantDoc-Dataset.git', PD_DIR)
 PD_TRAIN, PD_TEST = os.path.join(PD_DIR, 'train'), os.path.join(PD_DIR, 'test')
 if not os.path.isdir(PD_TEST):
     raise RuntimeError('PlantDoc unavailable — enable internet or mount it as a Kaggle Input.')
 
-# Extras are used only if mounted as Kaggle Inputs (no multi-GB downloads into /working).
-PC_DIR = find_input('plantcity')
-TOMATO_DIR = find_input('tomato-disease-multiple', 'tomato-disease', must_contain=('train',))
-print(f'PlantVillage: {PV_TRAIN}\nPlantDoc    : {PD_DIR}')
-print(f'PlantCity   : {PC_DIR or "not mounted (field data would help — add it in the Data tab)"}')
-print(f'Tomato extra: {TOMATO_DIR or "not mounted"}')
-
-class_names = sorted(d for d in os.listdir(PV_TRAIN) if os.path.isdir(os.path.join(PV_TRAIN, d)))
-NUM_CLASSES = len(class_names)
-CLASS_INDEX = {c: i for i, c in enumerate(class_names)}
-assert NUM_CLASSES == 38, f'expected 38 PlantVillage classes, got {NUM_CLASSES}'
+class_names = TOMATO_CLASSES
 with open(f'{WORK}/class_names.json', 'w') as f:
     json.dump(class_names, f, indent=2)
+
+print(f'Tomato train : {tom_root}')
+print(f'PlantVillage : {PV_TRAIN} (lab supplement + valid eval)')
+print(f'PlantDoc     : {PD_DIR} (field train + val early-stop + test eval)')
 
 
 # ============================================== 2. build the file indexes ==
 print('\n=== 2. Index images ===')
 lab_items, field_items, val_items = [], [], []
 
-train, _ = collect(PV_TRAIN, {c: c for c in class_names}, CLASS_INDEX, cap=None, tag='plantvillage')
+tom_map = build_mapping(tom_root, class_names, TOMATO_ALIASES, tag='tomato-primary')
+train, _ = collect(tom_root, tom_map, CLASS_INDEX, cap=None, tag='tomato-primary')
+lab_items += train
+
+pv_map = tomato_pv_mapping(PV_TRAIN)
+train, _ = collect(PV_TRAIN, pv_map, CLASS_INDEX, cap=None, tag='plantvillage-tomato-train')
 lab_items += train
 
 print('Hashing PlantDoc test to block train/test leakage...')
@@ -351,27 +376,16 @@ train, val = collect(PD_TRAIN, pd_map, CLASS_INDEX, cap=None, val_fraction=PD_VA
 field_items += train
 val_items += val
 
-if PC_DIR:
-    pc_root = find_class_root(PC_DIR, class_names)
-    pc_map = build_mapping(pc_root, class_names, tag='plantcity')
-    train, _ = collect(pc_root, pc_map, CLASS_INDEX, tag='plantcity')
-    field_items += train
-
-if TOMATO_DIR:  # mostly studio shots -> counts as lab, not field
-    tom_root = os.path.join(TOMATO_DIR, 'train')
-    tom_map = build_mapping(tom_root, class_names, TOMATO_ALIASES, tag='tomato')
-    train, _ = collect(tom_root, tom_map, CLASS_INDEX, cap=1000, tag='tomato-extra')
-    lab_items += train
-
 test_map = build_mapping(PD_TEST, class_names, PLANTDOC_ALIASES, tag='plantdoc-test')
 test_items, _ = collect(PD_TEST, test_map, CLASS_INDEX, cap=None, tag='plantdoc-test')
 
-pv_valid_items, _ = collect(PV_VALID, {c: c for c in class_names}, CLASS_INDEX,
-                            cap=None, tag='plantvillage-valid')
+pv_valid_items, _ = collect(PV_VALID, pv_map, CLASS_INDEX, cap=None, tag='plantvillage-valid')
 
+if not lab_items:
+    raise RuntimeError('No lab training images — check tomato-disease and PlantVillage mounts.')
 if not test_items:
-    raise RuntimeError('PlantDoc test is empty after mapping — check mapping_plantdoc-test.csv')
-if len(val_items) < 50:
+    raise RuntimeError('PlantDoc tomato test is empty after mapping — check mapping_plantdoc-test.csv')
+if len(val_items) < 20:
     print('WARNING: tiny PlantDoc val split — early stopping will be noisy.')
 
 field_by_class = defaultdict(list)
@@ -397,7 +411,7 @@ pd.DataFrame({
 def _decode(path):
     img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
     img.set_shape([None, None, 3])
-    return tf.image.convert_image_dtype(img, tf.float32)          # 0..1
+    return tf.image.convert_image_dtype(img, tf.float32)
 
 
 def _center_square(img):
@@ -422,17 +436,17 @@ def _sometimes(p, fn, img):
     return tf.cond(tf.random.uniform([]) < p, lambda: fn(img), lambda: img)
 
 
-def _soften(img):                                  # motion blur / cheap lens / digital zoom
+def _soften(img):
     f = tf.random.uniform([], 0.3, 0.7)
     small = tf.cast(tf.cast(IMG_SIZE, tf.float32) * f, tf.int32)
     return tf.image.resize(tf.image.resize(img, (small, small)), (IMG_SIZE, IMG_SIZE))
 
 
-def _noise(img):                                   # sensor noise in low light
+def _noise(img):
     return img + tf.random.normal(tf.shape(img), stddev=tf.random.uniform([], 0.01, 0.05))
 
 
-def _erase(img):                                   # occlusion by other leaves, hands, shadows
+def _erase(img):
     eh = tf.random.uniform([], IMG_SIZE // 10, IMG_SIZE // 3, tf.int32)
     ew = tf.random.uniform([], IMG_SIZE // 10, IMG_SIZE // 3, tf.int32)
     y = tf.random.uniform([], 0, IMG_SIZE - eh, tf.int32)
@@ -445,15 +459,15 @@ def _erase(img):                                   # occlusion by other leaves, 
 
 
 def _augment(img):
-    """Domain randomisation: the point is to destroy PlantVillage's clean-background shortcut."""
+    """Domain randomisation: destroy clean-background shortcuts from lab datasets."""
     img = _random_resized_crop(img)
     img = tf.image.random_flip_left_right(img)
     img = tf.image.random_flip_up_down(img)
     img = tf.image.rot90(img, tf.random.uniform([], 0, 4, tf.int32))
-    img = tf.image.random_brightness(img, 0.25)                  # sun vs shade
+    img = tf.image.random_brightness(img, 0.25)
     img = tf.image.random_contrast(img, 0.7, 1.4)
     img = tf.clip_by_value(img, 0.0, 1.0)
-    img = tf.image.random_saturation(img, 0.6, 1.5)              # white balance drift
+    img = tf.image.random_saturation(img, 0.6, 1.5)
     img = tf.image.random_hue(img, 0.04)
     img = _sometimes(0.25, _soften, img)
     img = _sometimes(0.25, _noise, img)
@@ -464,7 +478,7 @@ def _augment(img):
 def _load(path, label, training):
     img = _decode(path)
     img = _augment(img) if training else _center_square(img)
-    return img * 255.0, tf.one_hot(label, NUM_CLASSES)            # model contract: 0..255
+    return img * 255.0, tf.one_hot(label, NUM_CLASSES)
 
 
 def _ignore_errors(ds):
@@ -487,7 +501,7 @@ def _balanced_field_paths():
         parts.append(_paths_ds([(p, idx) for p in paths], shuffle=True))
         w = len(paths) ** FIELD_BALANCE_TEMP
         if class_names[idx] in HARD_FIELD_CLASSES:
-            w *= HARD_CLASS_BOOST  # boost weak classes
+            w *= HARD_CLASS_BOOST
         weights.append(w)
     w = np.array(weights, dtype=float)
     return tf.data.Dataset.sample_from_datasets(parts, (w / w.sum()).tolist(), seed=SEED)
@@ -512,7 +526,7 @@ def train_dataset(field_mix, mixup):
         raise RuntimeError('No training data found -- check dataset mounts and mappings.')
     ds = parts[0] if len(parts) == 1 else tf.data.Dataset.sample_from_datasets(
         parts, [w / sum(weights) for w in weights], seed=SEED)
-    ds = ds.repeat()  # prevent sample_from_datasets from exhausting mid-epoch
+    ds = ds.repeat()
     ds = ds.map(lambda p, l: _load(p, l, True), num_parallel_calls=AUTOTUNE)
     ds = _ignore_errors(ds).batch(BATCH, drop_remainder=True)
     if mixup and MIXUP_ALPHA > 0:
@@ -529,7 +543,7 @@ def eval_dataset(items, cache=False):
     return ds.batch(BATCH).prefetch(AUTOTUNE)
 
 
-pd_val_ds = eval_dataset(val_items, cache=True)      # small: cache it, it runs every epoch
+pd_val_ds = eval_dataset(val_items, cache=True)
 pd_test_ds = eval_dataset(test_items)
 pv_valid_ds = eval_dataset(pv_valid_items)
 
@@ -546,7 +560,7 @@ def build_model():
     x = keras.layers.GlobalAveragePooling2D()(x)
     x = keras.layers.Dropout(DROPOUT)(x)
     outputs = keras.layers.Dense(NUM_CLASSES, activation='softmax')(x)
-    return keras.Model(inputs, outputs, name='model_b'), base
+    return keras.Model(inputs, outputs, name='model_tomato'), base
 
 
 def set_finetune(base, unfreeze_last=FINETUNE_LAST_N):
@@ -562,7 +576,7 @@ def set_finetune(base, unfreeze_last=FINETUNE_LAST_N):
 
 def build_metrics():
     metrics = [keras.metrics.CategoricalAccuracy(name='acc')]
-    try:                                    # macro-F1 is the honest selector on skewed field data
+    try:
         metrics.append(keras.metrics.F1Score(average='macro', name='macro_f1'))
     except Exception:
         pass
@@ -598,7 +612,7 @@ def run_phase(model, base, cfg):
         cfg['lr'], decay_steps=cfg['epochs'] * cfg['steps'], alpha=0.03)
     optimizer = keras.optimizers.Adam(
         schedule, use_ema=USE_EMA, ema_momentum=0.999,
-        ema_overwrite_frequency=cfg['steps'] if USE_EMA else None)  # EMA weights get validated
+        ema_overwrite_frequency=cfg['steps'] if USE_EMA else None)
     model.compile(optimizer=optimizer,
                   loss=keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
                   metrics=build_metrics())
@@ -610,12 +624,12 @@ def run_phase(model, base, cfg):
                                           restore_best_weights=True),
             Heartbeat(max(50, cfg['steps'] // 8)),
         ])
-    model.save(MODEL_PATH)                       # crash-safe: always the best weights so far
+    model.save(MODEL_PATH)
     return history.history
 
 
 print('\n=== 3. Train ===')
-print(f'Backbone {BACKBONE} @ {IMG_SIZE}px | selection metric: {MONITOR}')
+print(f'Backbone {BACKBONE} @ {IMG_SIZE}px | {NUM_CLASSES} tomato classes | selection metric: {MONITOR}')
 model, backbone = build_model()
 history = {}
 for cfg in PHASES:
@@ -671,9 +685,8 @@ acc_tta, f1_tta, f1w_tta = scores(y_tta)
 print(f'PlantVillage valid (lab)      : {pv_acc * 100:.1f}% acc')
 print(f'PlantDoc test, deploy model   : {acc_plain * 100:.1f}% acc | macro-F1 {f1_plain:.3f}')
 print(f'PlantDoc test, + TTA          : {acc_tta * 100:.1f}% acc | macro-F1 {f1_tta:.3f}')
-print(f'(macro-F1 over the {len(supported_idx)} classes PlantDoc can actually score)')
+print(f'(macro-F1 over the {len(supported_idx)} tomato classes PlantDoc can score)')
 
-# Confidence gating: in the field it is better to say "not sure" than to be confidently wrong.
 conf = probs_plain.max(1)
 gate = pd.DataFrame([
     {'min_confidence': t,
@@ -700,6 +713,7 @@ print('\nWorst 5 (add field images for these first):\n' + measurable.tail(5).to_
 
 with open(f'{WORK}/evaluation_report.json', 'w') as f:
     json.dump({
+        'model': 'tomato-only',
         'backbone': BACKBONE, 'img_size': IMG_SIZE, 'num_classes': NUM_CLASSES,
         'scorable_classes': len(supported_idx),
         'pv_valid_acc': pv_acc,
@@ -710,18 +724,18 @@ with open(f'{WORK}/evaluation_report.json', 'w') as f:
     }, f, indent=2, default=float)
 
 # ------------------------------------------------------------------ plots ---
-plt.figure(figsize=(12, 10))
+plt.figure(figsize=(10, 8))
 sns.heatmap(confusion_matrix(y_true, y_tta, labels=range(NUM_CLASSES)), cmap='Blues', cbar=False,
             xticklabels=class_names, yticklabels=class_names)
-plt.tick_params(labelsize=5)
-plt.title('PlantDoc confusion matrix')
+plt.tick_params(labelsize=6)
+plt.title('PlantDoc tomato confusion matrix')
 plt.tight_layout()
 plt.savefig(f'{WORK}/confusion_matrix.png', dpi=200)
 plt.close()
 
-plt.figure(figsize=(10, 9))
+plt.figure(figsize=(8, 6))
 plt.barh(np.arange(len(measurable)), measurable['F1'], color='#4C72B0')
-plt.yticks(np.arange(len(measurable)), measurable['Class'], fontsize=7)
+plt.yticks(np.arange(len(measurable)), measurable['Class'], fontsize=8)
 plt.gca().invert_yaxis()
 plt.xlabel('F1')
 plt.tight_layout()
@@ -736,7 +750,7 @@ for b in bars:
              ha='center')
 plt.ylim(0, 105)
 plt.ylabel('Accuracy %')
-plt.title('Domain gap (deploy model, no TTA)')
+plt.title('Domain gap — tomato model (deploy, no TTA)')
 plt.tight_layout()
 plt.savefig(f'{WORK}/domain_gap.png', dpi=200)
 plt.close()
@@ -744,15 +758,15 @@ plt.close()
 
 # ====================================================== 6. package output ==
 print('\n=== 5. Package artifacts ===')
-KEEP = {'model_b_combined.keras', 'class_names.json', 'evaluation_report.json',
+KEEP = {'model_tomato.keras', 'class_names.json', 'evaluation_report.json',
         'per_class_metrics.csv', 'class_coverage.csv', 'confidence_gating.csv',
         'training_history.json', 'confusion_matrix.png', 'per_class_f1.png', 'domain_gap.png'}
 KEEP_PREFIX = ('mapping_',)
 
-for name in ('plantdoc', 'data'):                    # raw downloads, never the mounted inputs
+for name in ('plantdoc', 'data', 'tomato'):
     shutil.rmtree(os.path.join(WORK, name), ignore_errors=True)
 
-ART_ZIP = f'{WORK}/dsn_artifacts.zip'
+ART_ZIP = f'{WORK}/dsn_tomato_artifacts.zip'
 with zipfile.ZipFile(ART_ZIP, 'w', zipfile.ZIP_DEFLATED) as zf:
     for entry in sorted(os.listdir(WORK)):
         if entry in KEEP or entry.startswith(KEEP_PREFIX):
@@ -760,13 +774,13 @@ with zipfile.ZipFile(ART_ZIP, 'w', zipfile.ZIP_DEFLATED) as zf:
             if os.path.isfile(path):
                 zf.write(path, entry,
                          zipfile.ZIP_STORED if entry.endswith('.keras') else zipfile.ZIP_DEFLATED)
-print(f'dsn_artifacts.zip ({os.path.getsize(ART_ZIP) / 1e6:.1f} MB)')
+print(f'dsn_tomato_artifacts.zip ({os.path.getsize(ART_ZIP) / 1e6:.1f} MB)')
 disk_free('end')
 
 print("""
---- Serving (Flask) must use exactly this preprocessing ---
+--- Serving must use exactly this preprocessing ---
 from PIL import Image; import numpy as np, tensorflow as tf, json
-model = tf.keras.models.load_model('model_b_combined.keras')
+model = tf.keras.models.load_model('model_tomato.keras')
 classes = json.load(open('class_names.json'))
 
 def serve_image(path, size=%d):
