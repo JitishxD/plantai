@@ -1,0 +1,29 @@
+folder,key,mapped_to,how
+Apple Scab Leaf,apple scab,,UNMAPPED
+Apple leaf,apple,,UNMAPPED
+Apple rust leaf,apple rust,,UNMAPPED
+Bell_pepper leaf,bell pepper,,UNMAPPED
+Bell_pepper leaf spot,bell pepper spot,,UNMAPPED
+Blueberry leaf,blueberry,,UNMAPPED
+Cherry leaf,cherry,,UNMAPPED
+Corn Gray leaf spot,corn gray spot,,UNMAPPED
+Corn leaf blight,corn blight,,UNMAPPED
+Corn rust leaf,corn rust,,UNMAPPED
+Peach leaf,peach,,UNMAPPED
+Potato leaf early blight,potato early blight,,UNMAPPED
+Potato leaf late blight,potato late blight,,UNMAPPED
+Raspberry leaf,raspberry,,UNMAPPED
+Soyabean leaf,soyabean,,UNMAPPED
+Squash Powdery mildew leaf,squash powdery mildew,,UNMAPPED
+Strawberry leaf,strawberry,,UNMAPPED
+Tomato Early blight leaf,tomato early blight,Tomato___Early_blight,alias
+Tomato Septoria leaf spot,tomato septoria spot,Tomato___Septoria_leaf_spot,alias
+Tomato leaf,tomato,Tomato___healthy,alias
+Tomato leaf bacterial spot,tomato bacterial spot,Tomato___Bacterial_spot,alias
+Tomato leaf late blight,tomato late blight,Tomato___Late_blight,alias
+Tomato leaf mosaic virus,tomato mosaic virus,Tomato___Tomato_mosaic_virus,alias
+Tomato leaf yellow virus,tomato yellow virus,Tomato___Tomato_Yellow_Leaf_Curl_Virus,alias
+Tomato mold leaf,tomato mold,Tomato___Leaf_Mold,alias
+Tomato two spotted spider mites leaf,tomato two spotted spider mites,Tomato___Spider_mites Two-spotted_spider_mite,alias
+grape leaf,grape,,UNMAPPED
+grape leaf black rot,grape black rot,,UNMAPPED

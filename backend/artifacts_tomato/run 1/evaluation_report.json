@@ -1,0 +1,84 @@
+{
+  "model": "tomato-only",
+  "backbone": "efficientnetv2b0",
+  "img_size": 256,
+  "num_classes": 10,
+  "scorable_classes": 8,
+  "pv_valid_acc": 0.9840785169029443,
+  "plantdoc": {
+    "acc": 0.6666666666666666,
+    "macro_f1_supported": 0.6498307656395892,
+    "weighted_f1": 0.6501542646043924
+  },
+  "plantdoc_tta": {
+    "acc": 0.6811594202898551,
+    "macro_f1_supported": 0.6772728638937079,
+    "weighted_f1": 0.677028606640527
+  },
+  "train_images": {
+    "lab": 43192,
+    "field": 553
+  },
+  "per_class": [
+    {
+      "Class": "Tomato___Bacterial_spot",
+      "PlantDoc support": 9,
+      "Field images": 85,
+      "F1": 0.471
+    },
+    {
+      "Class": "Tomato___Early_blight",
+      "PlantDoc support": 9,
+      "Field images": 68,
+      "F1": 0.778
+    },
+    {
+      "Class": "Tomato___Late_blight",
+      "PlantDoc support": 10,
+      "Field images": 77,
+      "F1": 0.909
+    },
+    {
+      "Class": "Tomato___Leaf_Mold",
+      "PlantDoc support": 6,
+      "Field images": 73,
+      "F1": 0.444
+    },
+    {
+      "Class": "Tomato___Septoria_leaf_spot",
+      "PlantDoc support": 11,
+      "Field images": 115,
+      "F1": 0.696
+    },
+    {
+      "Class": "Tomato___Spider_mites Two-spotted_spider_mite",
+      "PlantDoc support": 0,
+      "Field images": 2,
+      "F1": 0.0
+    },
+    {
+      "Class": "Tomato___Target_Spot",
+      "PlantDoc support": 0,
+      "Field images": 0,
+      "F1": 0.0
+    },
+    {
+      "Class": "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
+      "PlantDoc support": 6,
+      "Field images": 55,
+      "F1": 0.909
+    },
+    {
+      "Class": "Tomato___Tomato_mosaic_virus",
+      "PlantDoc support": 10,
+      "Field images": 33,
+      "F1": 0.462
+    },
+    {
+      "Class": "Tomato___healthy",
+      "PlantDoc support": 8,
+      "Field images": 45,
+      "F1": 0.75
+    }
+  ]
+}
