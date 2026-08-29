@@ -1,8 +1,22 @@
+"""
+Tomato leaf disease — domain-robust classifier (PlantVillage/lab -> PlantDoc/field)
+
+Rewrite notes vs. previous version:
+  * IMG_SIZE 64 -> 224 (64px destroys lesion texture; ResNet50 left a 2x2 feature map)
+  * Leaf isolation is now an AUGMENTATION CHANNEL, not a destructive preprocess.
+    Cached white-bg images are re-composited onto RANDOM backgrounds at train time.
+  * YOLO is OFF unless a real leaf detector is available (COCO yolo11n is not one).
+  * Eval is variant-matched (iso model on iso images), plus raw+iso fusion TTA.
+  * Lab sources de-duplicated + per-class capped; PlantDoc test leakage blocked by hash.
+  * Model input is ALWAYS float32 0..255; backbone preprocessing lives inside the model.
+"""
+
 import os
 import re
 import sys
 import json
 import time
+import glob
 import shutil
 import hashlib
 import zipfile
@@ -19,667 +33,215 @@ from tensorflow import keras
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 from PIL import Image
 
-# ----------------------------------------------------------------- config ---
-WORK = '/kaggle/working'
+# ============================================================== config =====
+WORK = "/kaggle/working"
 SEED = 42
-IMG_SIZE = 256
+
+IMG_SIZE = 224  # >=224. 64px was the main accuracy regression.
 BATCH = 32
-BACKBONE = 'efficientnetv2b0'      # efficientnetv2b0 | efficientnetb0 | mobilenetv2 | resnet50
+BACKBONE = "efficientnetv2b0"  # efficientnetv2b0 | efficientnetv2s | efficientnetb0 | resnet50 | mobilenetv2
 
-# Hierarchical pipeline (Hamad et al., IEEE Access 2025):
-# YOLO11 detect -> SAM/GrabCut segment -> classifier -> LIME at eval.
-PIPELINE_ENABLED = True
-PAPER_PROTOCOL = False              # True: PV-only train, PlantDoc eval-only (paper setup)
-RUN_FLAT_BASELINE = True            # train/eval flat classifier for domain-gap comparison
-PIPELINE_CLASSIFIER = 'resnet50'    # resnet50 (paper) | efficientnetv2b0 (legacy)
-PIPELINE_IMG_SIZE = 64 if PIPELINE_CLASSIFIER == 'resnet50' else IMG_SIZE
-PIPELINE_CACHE_DIR = f'{WORK}/pipeline_cache'
+# ---- leaf isolation (the "pipeline") -------------------------------------
+# 'mix'  : train on raw + cached isolated crops, random backgrounds  <-- best accuracy
+# 'iso'  : isolated only (reproduces the paper protocol, lower field acc)
+# 'off'  : ignore the cache entirely (pure baseline)
+ISOLATION_MODE = "mix"
+ISO_MIX_PROB = 0.40  # P(draw the isolated variant) per training sample
+BG_RANDOMIZE_PROB = 0.65  # P(replace white bg with a random bg) on iso samples
+BG_WHITE_THRESH = 0.94  # min-channel value above which a pixel counts as background
+MAX_WHITE_FRACTION = 0.90  # reject cache entries where segmentation ate the leaf
+FUSE_ISO_AT_EVAL = True  # average raw + iso predictions at test time
+
+PIPELINE_CACHE_DIR = f"{WORK}/pipeline_cache"
+PIPELINE_CACHE_INPUT_PATH = (
+    "/kaggle/input/dangerous-tamatar"  # auto-discovery also runs
+)
+CACHE_TAGS = ("lab", "field", "pd_val", "pd_test", "pv_valid", "pv_test")
+ISO_MANIFEST = f"{WORK}/iso_manifest.json"
+
+BUILD_CACHE_ONLY = False  # True: (re)build cache with the FIXED isolator, zip, exit
 PIPELINE_REBUILD_CACHE = False
-PIPELINE_CACHE_ZIP = f'{WORK}/pipeline_cache.zip'          # saved to output after caching
-PIPELINE_CACHE_INPUT_PATH = '/kaggle/input/datasets/jitishxd/dangerous-tamatar' # Explicit path to the extracted cache dataset
-BUILD_CACHE_ONLY = False             # True: build cache + zip + exit (no training). False: restore cache from Input + train
+PIPELINE_CACHE_ZIP = f"{WORK}/pipeline_cache.zip"
 
-# Stage 1 — YOLO11 leaf detection (paper: Roboflow leaf dataset, yolo11n @ 640px)
-YOLO_WEIGHTS = 'yolo11n.pt'
+# ---- isolation backend (only used when building/extending the cache) -----
+USE_YOLO = False  # only flip on if you have a *leaf-trained* detector
+YOLO_WEIGHTS = "yolo11n.pt"
 YOLO_IMGSZ = 640
 YOLO_CONF = 0.25
 YOLO_TRAIN_EPOCHS = 50
-YOLO_FALLBACK_CENTER_CROP = True    # use full image when no confident box
+BOX_MARGIN = 0.12  # expand detected box by 12% before cropping
 
-# Stage 2 — SAM segmentation (paper: largest mask; auto-downloaded like PlantDoc)
-SAM_CHECKPOINT = f'{WORK}/sam_vit_b_01ec64.pth'
-SAM_MODEL_TYPE = 'vit_b'
-SAM_WEIGHTS_URL = 'https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth'
-SAM_REPO = 'https://github.com/facebookresearch/segment-anything.git'
-AUTO_DOWNLOAD_SAM = True            # download ~375 MB weights when missing (needs Internet)
-SEGMENTATION_BACKEND = 'sam'       # auto | sam | grabcut | none
+SEGMENTATION_BACKEND = "sam"  # sam | grabcut | none
+SAM_CHECKPOINT = f"{WORK}/sam_vit_b_01ec64.pth"
+SAM_MODEL_TYPE = "vit_b"
+SAM_WEIGHTS_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+SAM_REPO = "https://github.com/facebookresearch/segment-anything.git"
+AUTO_DOWNLOAD_SAM = True
+MASK_MIN_AREA, MASK_MAX_AREA = 0.08, 0.92  # sanity window for an accepted mask
 
-# Stage 3 — classifier (paper ResNet-50 @ 64px, AdamW, 50 epochs, batch 64)
-PAPER_SPLIT = (0.70, 0.15, 0.15)    # train / val / test per class (PlantVillage)
-PAPER_EPOCHS = 50
-PAPER_BATCH = 64
-PAPER_LR = 3e-4
-PAPER_WEIGHT_DECAY = 1e-4
+# ---- data --------------------------------------------------------------
+PAPER_PROTOCOL = False  # True: train on PV only, PlantDoc strictly held out
+RUN_FLAT_BASELINE = False  # True doubles runtime; gives the ablation table
+DEDUP_LAB = True  # tomato-multiple-sources overlaps PlantVillage heavily
+MAX_PER_CLASS_LAB = 3000
+PV_EVAL_CAP = 2000
+PD_VAL_FRACTION = 0.20
+PAPER_SPLIT = (0.70, 0.15, 0.15)
 
-# Stage 4 — LIME interpretability (inference-time only)
-LIME_SAMPLES = 6
-LIME_NUM_FEATURES = 8
+# ---- optimisation ------------------------------------------------------
+LABEL_SMOOTHING = 0.05
+MIXUP_ALPHA = 0.2
+DROPOUT = 0.35
+WEIGHT_DECAY = 1e-4
+USE_EMA = True
+USE_TTA = True
+FIELD_BALANCE_TEMP = 0.5
+HARD_CLASS_BOOST = 2.5
+HARD_FIELD_CLASSES = {
+    "Tomato___Bacterial_spot",
+    "Tomato___Leaf_Mold",
+    "Tomato___Early_blight",
+    "Tomato___Tomato_mosaic_virus",
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
+}
 
-# Kaggle: set False if you already ran `!pip install ...` in a notebook cell above.
-AUTO_INSTALL_DEPS = True
-
-# pip packages for the hierarchical pipeline (see ensure_kaggle_dependencies below)
-PIPELINE_PIP_PACKAGES = [
-    'opencv-python-headless',
-    'ultralytics',
-    'lime',
-    'scikit-image',
+PHASES = [
+    dict(
+        name="warmup",
+        epochs=4,
+        steps=400,
+        lr=1e-3,
+        field_mix=0.35,
+        iso_mix=ISO_MIX_PROB,
+        mixup=False,
+        finetune=False,
+        patience=3,
+    ),
+    dict(
+        name="finetune",
+        epochs=12,
+        steps=800,
+        lr=1e-4,
+        field_mix=0.55,
+        iso_mix=ISO_MIX_PROB,
+        mixup=True,
+        finetune=True,
+        patience=4,
+    ),
+    dict(
+        name="polish",
+        epochs=6,
+        steps=500,
+        lr=2e-5,
+        field_mix=0.70,
+        iso_mix=ISO_MIX_PROB,
+        mixup=False,
+        finetune=True,
+        patience=3,
+    ),
 ]
 
+LIME_SAMPLES = 6
+LIME_NUM_FEATURES = 8
+AUTO_INSTALL_DEPS = True
+
+MODEL_PATH = f"{WORK}/model_tomato.keras"
+FLAT_MODEL_PATH = f"{WORK}/model_tomato_flat.keras"
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+AUTOTUNE = tf.data.AUTOTUNE
+
+TOMATO_CLASSES = [
+    "Tomato___Bacterial_spot",
+    "Tomato___Early_blight",
+    "Tomato___Late_blight",
+    "Tomato___Leaf_Mold",
+    "Tomato___Septoria_leaf_spot",
+    "Tomato___Spider_mites Two-spotted_spider_mite",
+    "Tomato___Target_Spot",
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
+    "Tomato___Tomato_mosaic_virus",
+    "Tomato___healthy",
+]
+NUM_CLASSES = len(TOMATO_CLASSES)
+CLASS_INDEX = {c: i for i, c in enumerate(TOMATO_CLASSES)}
+class_names = TOMATO_CLASSES
+
+keras.utils.set_random_seed(SEED)
 cv2 = None
 
 
-def ensure_kaggle_dependencies():
-    """Install pipeline packages when missing.
-
-    On Kaggle notebooks you can instead run this in the first cell:
-        !pip install -q opencv-python-headless ultralytics lime scikit-image
-
-    In a .py script (`!` does not work), this uses subprocess automatically.
-    """
-    if not PIPELINE_ENABLED or not AUTO_INSTALL_DEPS:
+# ============================================================== deps =======
+def ensure_deps():
+    if not AUTO_INSTALL_DEPS:
         return
-    missing = []
-    checks = [
-        ('cv2', 'opencv-python-headless'),
-        ('ultralytics', 'ultralytics'),
-        ('lime', 'lime'),
-        ('skimage', 'scikit-image'),
-    ]
-    for mod, pkg in checks:
+    need = []
+    for mod, pkg in [
+        ("cv2", "opencv-python-headless"),
+        ("lime", "lime"),
+        ("skimage", "scikit-image"),
+    ]:
         try:
             importlib.import_module(mod)
         except ImportError:
-            if pkg not in missing:
-                missing.append(pkg)
-    if missing:
-        print('Installing pipeline dependencies:', ' '.join(missing))
+            need.append(pkg)
+    if USE_YOLO or BUILD_CACHE_ONLY:
+        try:
+            importlib.import_module("ultralytics")
+        except ImportError:
+            need.append("ultralytics")
+    if need:
+        print("Installing:", " ".join(need))
         subprocess.check_call(
-            [sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', *missing],
+            [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *need],
             stdout=subprocess.DEVNULL,
         )
-        print('Done.')
 
 
-ensure_kaggle_dependencies()
-
+ensure_deps()
 try:
     import cv2
 except ImportError:
     cv2 = None
 
-LABEL_SMOOTHING = 0.05
-MIXUP_ALPHA = 0.2                  # 0 disables mixup
-DROPOUT = 0.3
-USE_EMA = True                     # Polyak averaging: free ~0.5-1 pt, smoother val loss
-USE_TTA = True                     # eval-time only
-FIELD_BALANCE_TEMP = 0.5           # 0 = all classes equally likely, 1 = natural counts
-HARD_CLASS_BOOST = 3.0             # extra sampling weight for weak classes
-HARD_FIELD_CLASSES = {             # tomato classes with F1 < 0.4 in previous runs
-    'Tomato___Bacterial_spot',
-    'Tomato___Leaf_Mold',
-    'Tomato___Early_blight',
-    'Tomato___Tomato_mosaic_virus',
-    'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
-}
-MAX_PER_SOURCE_FOLDER = 1500       # stop one huge folder from owning a class
-PD_VAL_FRACTION = 0.15             # PlantDoc hold-out used for early stopping
-FINETUNE_LAST_N = None             # None = whole backbone (BatchNorm always stays frozen)
 
-# Training schedule. field_mix = share of each batch drawn from real field photos.
-PHASES = [
-    dict(name='warmup',   epochs=4,  steps=500, lr=1e-3, field_mix=0.50, mixup=False,
-         finetune=False, patience=3),
-    dict(name='finetune', epochs=14, steps=1000, lr=1e-4, field_mix=0.65, mixup=True,
-         finetune=True,  patience=4),
-    dict(name='polish',   epochs=6,  steps=600, lr=2e-5, field_mix=0.85, mixup=False,
-         finetune=True,  patience=3),
-]
-
-MODEL_PATH = f'{WORK}/model_tomato.keras'
-FLAT_MODEL_PATH = f'{WORK}/model_tomato_flat.keras'
-IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp')
-AUTOTUNE = tf.data.AUTOTUNE
-CLASSIFIER_IMG_SIZE = PIPELINE_IMG_SIZE if PIPELINE_ENABLED else IMG_SIZE
-CLASSIFIER_BATCH = PAPER_BATCH if (PIPELINE_ENABLED and PIPELINE_CLASSIFIER == 'resnet50') else BATCH
-
-# PlantVillage-aligned tomato taxonomy (10 classes). Powdery mildew in the Kaggle
-# tomato-disease dataset is intentionally skipped — it has no PlantVillage/PlantDoc label.
-TOMATO_CLASSES = [
-    'Tomato___Bacterial_spot',
-    'Tomato___Early_blight',
-    'Tomato___Late_blight',
-    'Tomato___Leaf_Mold',
-    'Tomato___Septoria_leaf_spot',
-    'Tomato___Spider_mites Two-spotted_spider_mite',
-    'Tomato___Target_Spot',
-    'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
-    'Tomato___Tomato_mosaic_virus',
-    'Tomato___healthy',
-]
-NUM_CLASSES = len(TOMATO_CLASSES)
-CLASS_INDEX = {c: i for i, c in enumerate(TOMATO_CLASSES)}
-
-keras.utils.set_random_seed(SEED)
-
-BACKBONES = {
-    # rescale=None -> backbone expects raw 0..255 (EfficientNet does its own normalisation)
-    'efficientnetv2b0': dict(ctor=keras.applications.EfficientNetV2B0, rescale=None),
-    'efficientnetb0':   dict(ctor=keras.applications.EfficientNetB0,   rescale=None),
-    'mobilenetv2':      dict(ctor=keras.applications.MobileNetV2,      rescale=(1 / 127.5, -1.0)),
-    'resnet50':         dict(ctor=keras.applications.ResNet50,         rescale=None),
-}
-_active_backbone = PIPELINE_CLASSIFIER if PIPELINE_ENABLED else BACKBONE
-assert _active_backbone in BACKBONES, f'unknown backbone {_active_backbone}'
-
-
-# ------------------------------------------------------------------ utils ---
+# ============================================================== utils ======
 def run_cmd(cmd):
-    print('>', ' '.join(cmd))
+    print(">", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
 def kaggle_download(dataset, dest):
-    run_cmd(['kaggle', 'datasets', 'download', '-d', dataset, '-p', dest, '--unzip'])
+    run_cmd(["kaggle", "datasets", "download", "-d", dataset, "-p", dest, "--unzip"])
 
 
 def git_clone(repo, dest):
     shutil.rmtree(dest, ignore_errors=True)
-    run_cmd(['git', 'clone', '-q', repo, dest])
+    run_cmd(["git", "clone", "-q", repo, dest])
 
 
-def download_file(url, dest):
-    """Download a large file (SAM weights) — same idea as git_clone for PlantDoc."""
-    if os.path.isfile(dest) and os.path.getsize(dest) > 1_000_000:
-        return dest
-    os.makedirs(os.path.dirname(dest) or '.', exist_ok=True)
-    print(f'  Downloading {os.path.basename(dest)} (~375 MB, needs Internet)...')
-    try:
-        import urllib.request
-        urllib.request.urlretrieve(url, dest)
-    except Exception as exc:
-        if os.path.isfile(dest):
-            os.remove(dest)
-        raise RuntimeError(f'download failed: {exc}') from exc
-    print(f'  Saved -> {dest}')
-    return dest
-
-
-def find_sam_checkpoint():
-    """Locate SAM vit_b weights: Kaggle Input mount, working dir, or download."""
-    if os.path.isfile(SAM_CHECKPOINT) and os.path.getsize(SAM_CHECKPOINT) > 1_000_000:
-        return SAM_CHECKPOINT
-    mounted = find_input('sam', 'segment-anything', must_contain=())
-    if mounted:
-        for root, _, files in os.walk(mounted):
-            for fname in files:
-                if fname == 'sam_vit_b_01ec64.pth' or fname.endswith('.pth') and 'vit_b' in fname:
-                    return os.path.join(root, fname)
-    if AUTO_DOWNLOAD_SAM and SEGMENTATION_BACKEND in {'auto', 'sam'}:
-        return download_file(SAM_WEIGHTS_URL, SAM_CHECKPOINT)
-    return None
-
-
-def ensure_sam_package():
-    """pip install segment-anything when SAM is requested (auto-download like PlantDoc clone)."""
-    if SEGMENTATION_BACKEND not in {'auto', 'sam'}:
-        return
-    try:
-        importlib.import_module('segment_anything')
-        return
-    except ImportError:
-        pass
-    print('  Installing segment-anything from GitHub (needs Internet)...')
-    subprocess.check_call(
-        [sys.executable, '-m', 'pip', 'install', '-q', f'git+{SAM_REPO}'],
-    )
-    print('  segment-anything installed.')
-
-
-def ensure_sam_ready():
-    """Download weights + install package before caching images (paper Stage 2)."""
-    if SEGMENTATION_BACKEND == 'grabcut':
-        print('  Segmentation backend=grabcut — skipping SAM download')
-        return False
-    if SEGMENTATION_BACKEND == 'none':
-        print('  Segmentation backend=none — skipping leaf mask')
-        return False
-    try:
-        ensure_sam_package()
-        ckpt = find_sam_checkpoint()
-        if ckpt:
-            global SAM_CHECKPOINT
-            SAM_CHECKPOINT = ckpt
-            return True
-    except Exception as exc:
-        print(f'  SAM setup failed ({exc}) — will use GrabCut fallback')
-    return False
-
-
-def disk_free(label=''):
+def disk_free(label=""):
     free = shutil.disk_usage(WORK).free / 1e9
-    print(f'Disk [{label}]: {free:.1f} GB free')
+    print(f"Disk [{label}]: {free:.1f} GB free")
     return free
 
 
 def stable_bucket(key, mod=100):
-    """Deterministic 0..mod-1 bucket (python's hash() is salted per process)."""
     return int(hashlib.md5(key.encode()).hexdigest()[:8], 16) % mod
 
 
-def file_md5(path):
-    h = hashlib.md5()
-    with open(path, 'rb') as f:
-        for chunk in iter(lambda: f.read(1 << 20), b''):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-# ========================================= hierarchical pipeline (paper) ===
-_yolo_model = None
-_pipeline_stats = defaultdict(int)
-
-def _pipeline_cache_path(src_path, tag=''):
-    """Generate cache path using original folder and filename (e.g., Tomato___Blight/img.jpg)."""
-    parts = os.path.normpath(src_path).split(os.sep)
-    rel_path = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else parts[-1]
-    
-    # Sanitize forbidden characters for Kaggle dataset upload compatibility
-    import re
-    rel_path = re.sub(r'[?&]', '_', rel_path)
-    rel_path = re.sub(r'\s+\.', '.', rel_path)
-    
-    # Ensure it ends in .jpg since we save it as a JPEG
-    rel_path = os.path.splitext(rel_path)[0] + '.jpg'
-    sub = tag or 'shared'
-    return os.path.join(PIPELINE_CACHE_DIR, sub, rel_path)
-
-
-def _center_square_pil(pil_img):
-    w, h = pil_img.size
-    s = min(w, h)
-    l, t = (w - s) // 2, (h - s) // 2
-    return pil_img.crop((l, t, l + s, t + s))
-
-
-def _load_yolo():
-    global _yolo_model
-    if _yolo_model is not None:
-        return _yolo_model
+def fast_hash(path, nbytes=131072):
+    """Partial content hash — ~20x faster than full md5, effectively exact for JPEGs."""
     try:
-        from ultralytics import YOLO
-        _yolo_model = YOLO(YOLO_WEIGHTS)
-        print(f'  YOLO11 loaded: {YOLO_WEIGHTS}')
-    except Exception as exc:
-        print(f'  YOLO11 unavailable ({exc}) — using center-crop fallback')
-        _yolo_model = False
-    return _yolo_model
-
-
-def _train_yolo_leaf_detector():
-    """Optional: fine-tune YOLO11 on a Roboflow-style leaf detection dataset if mounted."""
-    roboflow = find_input('roboflow', 'leaf-detection', 'plant-leaf')
-    if roboflow is None:
-        print('  Roboflow leaf dataset not mounted — skipping YOLO fine-tune (using pretrained weights)')
-        return _load_yolo()
-    try:
-        from ultralytics import YOLO
-        data_yaml = None
-        for root, _, files in os.walk(roboflow):
-            for fname in files:
-                if fname.endswith('.yaml') or fname == 'data.yml':
-                    data_yaml = os.path.join(root, fname)
-                    break
-            if data_yaml:
-                break
-        if not data_yaml:
-            print('  Roboflow folder found but no data.yaml — using pretrained YOLO weights')
-            return _load_yolo()
-        print(f'  Fine-tuning YOLO11 on {data_yaml} for {YOLO_TRAIN_EPOCHS} epochs...')
-        model = YOLO(YOLO_WEIGHTS)
-        model.train(data=data_yaml, imgsz=YOLO_IMGSZ, epochs=YOLO_TRAIN_EPOCHS, batch=16,
-                    optimizer='SGD', lr0=0.01, momentum=0.937, weight_decay=0.0005, cos_lr=True,
-                    project=f'{WORK}/yolo_leaf', name='train', exist_ok=True, verbose=False)
-        best = os.path.join(f'{WORK}/yolo_leaf/train/weights/best.pt')
-        global _yolo_model
-        _yolo_model = YOLO(best if os.path.isfile(best) else YOLO_WEIGHTS)
-        return _yolo_model
-    except Exception as exc:
-        print(f'  YOLO fine-tune failed ({exc}) — using pretrained weights')
-        return _load_yolo()
-
-
-def _yolo_crop(pil_img):
-    """Stage 1: YOLO leaf detection. Returns (cropped_pil, box_xyxy_on_crop | None)."""
-    model = _load_yolo()
-    if not model:
-        _pipeline_stats['yolo_fallback'] += 1
-        return (_center_square_pil(pil_img) if YOLO_FALLBACK_CENTER_CROP else pil_img), None
-    # Downscale very large images before YOLO inference (saves GPU memory + time)
-    w_orig, h_orig = pil_img.size
-    max_side = max(w_orig, h_orig)
-    if max_side > 1024:
-        scale = 1024.0 / max_side
-        pil_small = pil_img.resize((int(w_orig * scale), int(h_orig * scale)), Image.BILINEAR)
-    else:
-        scale = 1.0
-        pil_small = pil_img
-    arr = np.asarray(pil_small)
-    try:
-        results = model.predict(arr, imgsz=YOLO_IMGSZ, conf=YOLO_CONF, verbose=False)
-    except Exception:
-        _pipeline_stats['yolo_fallback'] += 1
-        return (_center_square_pil(pil_img) if YOLO_FALLBACK_CENTER_CROP else pil_img), None
-    if not results or results[0].boxes is None or len(results[0].boxes) == 0:
-        _pipeline_stats['yolo_fallback'] += 1
-        return (_center_square_pil(pil_img) if YOLO_FALLBACK_CENTER_CROP else pil_img), None
-    boxes = results[0].boxes.xyxy.cpu().numpy()
-    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    bx1, by1, bx2, by2 = boxes[int(areas.argmax())]
-    # Scale box back to original resolution
-    if scale != 1.0:
-        bx1, by1, bx2, by2 = bx1 / scale, by1 / scale, bx2 / scale, by2 / scale
-    x1, y1 = max(0, int(bx1)), max(0, int(by1))
-    x2, y2 = min(w_orig, int(bx2)), min(h_orig, int(by2))
-    if x2 <= x1 or y2 <= y1:
-        _pipeline_stats['yolo_fallback'] += 1
-        return (_center_square_pil(pil_img) if YOLO_FALLBACK_CENTER_CROP else pil_img), None
-    _pipeline_stats['yolo_detect'] += 1
-    # Return crop AND the original-image box (for SAM box-prompt)
-    return pil_img.crop((x1, y1, x2, y2)), np.array([x1, y1, x2, y2], dtype=np.float32)
-
-
-_sam_predictor = None
-
-
-def _load_sam():
-    global _sam_predictor
-    if _sam_predictor is not None:
-        return _sam_predictor
-    if SEGMENTATION_BACKEND == 'none':
-        _sam_predictor = False
-        return _sam_predictor
-    if SEGMENTATION_BACKEND == 'grabcut':
-        _sam_predictor = False
-        return _sam_predictor
-    try:
-        import torch
-        from segment_anything import SamPredictor, sam_model_registry
-        ckpt = SAM_CHECKPOINT if os.path.isfile(SAM_CHECKPOINT) else find_sam_checkpoint()
-        if not ckpt or not os.path.isfile(ckpt):
-            print('  SAM weights unavailable — using GrabCut fallback')
-            _sam_predictor = False
-            return _sam_predictor
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=ckpt)
-        sam.to(device)
-        _sam_predictor = SamPredictor(sam)
-        print(f'  SAM loaded: {SAM_MODEL_TYPE} ({ckpt}) on {device} [SamPredictor mode]')
-    except Exception as exc:
-        print(f'  SAM unavailable ({exc}) — using GrabCut fallback')
-        _sam_predictor = False
-    return _sam_predictor
-
-
-def _grabcut_segment(pil_img):
-    if cv2 is None:
-        _pipeline_stats['segment_skip'] += 1
-        return pil_img
-    # Downscale large images before GrabCut to avoid expensive CPU iterations
-    w, h = pil_img.size
-    max_side = max(w, h)
-    if max_side > 512:
-        scale = 512.0 / max_side
-        pil_small = pil_img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
-    else:
-        pil_small = pil_img
-    img = np.asarray(pil_small.convert('RGB'))
-    h, w = img.shape[:2]
-    mask = np.zeros((h, w), np.uint8)
-    margin = max(2, int(min(h, w) * 0.05))
-    rect = (margin, margin, w - 2 * margin, h - 2 * margin)
-    bgd = np.zeros((1, 65), np.float64)
-    fgd = np.zeros((1, 65), np.float64)
-    try:
-        cv2.grabCut(img, mask, rect, bgd, fgd, 3, cv2.GC_INIT_WITH_RECT)
-        leaf_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
-    except Exception:
-        _pipeline_stats['segment_skip'] += 1
-        return pil_img
-    if leaf_mask.sum() < 0.05 * h * w:
-        _pipeline_stats['segment_skip'] += 1
-        return pil_img
-    # If we downscaled, resize the mask back to original
-    orig_arr = np.asarray(pil_img.convert('RGB'))
-    if pil_small is not pil_img:
-        leaf_mask = np.array(Image.fromarray(leaf_mask).resize(pil_img.size, Image.NEAREST))
-    else:
-        orig_arr = img
-    bg = np.full_like(orig_arr, 255)
-    out = np.where(leaf_mask[..., None], orig_arr, bg)
-    _pipeline_stats['grabcut'] += 1
-    return Image.fromarray(out.astype(np.uint8))
-
-
-def _sam_segment(pil_img, has_yolo_box=False):
-    """SAM segmentation using SamPredictor with box prompt (fast path).
-
-    When has_yolo_box=True the image is already YOLO-cropped to the leaf ROI,
-    so we prompt SAM with the full crop extent to get a tight leaf mask.
-    """
-    predictor = _load_sam()
-    if not predictor:
-        return _grabcut_segment(pil_img)
-    arr = np.asarray(pil_img.convert('RGB'))
-    h, w = arr.shape[:2]
-    try:
-        predictor.set_image(arr)
-        if has_yolo_box:
-            # Image is the YOLO crop — use full extent as box prompt
-            box = np.array([0, 0, w, h], dtype=np.float32)
-        else:
-            # No YOLO box — use a padded center box as fallback prompt
-            margin = int(min(h, w) * 0.1)
-            box = np.array([margin, margin, w - margin, h - margin], dtype=np.float32)
-        masks, scores, _ = predictor.predict(
-            box=box,
-            multimask_output=True,
-        )
-        best_idx = int(scores.argmax())
-        mask = masks[best_idx].astype(np.uint8)
-    except Exception:
-        return _grabcut_segment(pil_img)
-    if mask.sum() < 0.05 * h * w:
-        return _grabcut_segment(pil_img)
-    bg = np.full_like(arr, 255)
-    out = np.where(mask[..., None], arr, bg)
-    _pipeline_stats['sam'] += 1
-    return Image.fromarray(out.astype(np.uint8))
-
-
-def _segment_leaf(pil_img, has_yolo_box=False):
-    if SEGMENTATION_BACKEND == 'none':
-        return pil_img
-    if SEGMENTATION_BACKEND == 'grabcut':
-        return _grabcut_segment(pil_img)
-    if SEGMENTATION_BACKEND == 'sam':
-        return _sam_segment(pil_img, has_yolo_box=has_yolo_box)
-    # auto: SAM if available, else GrabCut
-    return _sam_segment(pil_img, has_yolo_box=has_yolo_box)
-
-
-def isolate_leaf_image(pil_img):
-    """Paper stages 1–2: YOLO crop then SAM/GrabCut background removal."""
-    cropped, box = _yolo_crop(pil_img)
-    return _segment_leaf(cropped, has_yolo_box=(box is not None))
-
-
-def cache_pipeline_items(items, tag):
-    """Pre-process images through the hierarchical pipeline once; reuse during training."""
-    if not PIPELINE_ENABLED:
-        return list(items)
-    # Pre-create the output directory once (not per-file)
-    tag_dir = os.path.join(PIPELINE_CACHE_DIR, tag or 'shared')
-    os.makedirs(tag_dir, exist_ok=True)
-    cached, total = [], len(items)
-    skipped = 0
-    t0 = time.time()
-    for i, (src, label) in enumerate(items):
-        dst = _pipeline_cache_path(src, tag)
-        if not PIPELINE_REBUILD_CACHE and os.path.isfile(dst):
-            skipped += 1
-        else:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            try:
-                isolate_leaf_image(Image.open(src).convert('RGB')).save(dst, quality=92)
-            except Exception:
-                shutil.copy2(src, dst)
-        cached.append((dst, label))
-        if (i + 1) % 200 == 0 or i + 1 == total:
-            elapsed = time.time() - t0
-            rate = (i + 1 - skipped) / max(elapsed, 1e-3) if (i + 1 - skipped) > 0 else 0
-            remaining = total - (i + 1)
-            eta = remaining / rate if rate > 0 else 0
-            print(f'  pipeline cache [{tag}]: {i + 1}/{total} '
-                  f'({skipped} cached, {rate:.1f} img/s, ETA {eta:.0f}s)', flush=True)
-    return cached
-
-
-
-def restore_pipeline_cache():
-    """Restore pipeline cache from a mounted Kaggle input dataset (runs before caching)."""
-    if not PIPELINE_ENABLED:
-        return False
-    if os.path.isdir(PIPELINE_CACHE_DIR) and len(os.listdir(PIPELINE_CACHE_DIR)) > 0:
-        return True
-
-    if not PIPELINE_CACHE_INPUT_PATH or not os.path.isdir(PIPELINE_CACHE_INPUT_PATH):
-        print(f'  No extracted pipeline cache found at {PIPELINE_CACHE_INPUT_PATH} — will build from scratch')
-        return False
-
-    print(f'  Restoring extracted pipeline cache directly from {PIPELINE_CACHE_INPUT_PATH}...')
-    t0 = time.time()
-    shutil.copytree(PIPELINE_CACHE_INPUT_PATH, PIPELINE_CACHE_DIR, dirs_exist_ok=True)
-    n = sum(len(files) for _, _, files in os.walk(PIPELINE_CACHE_DIR))
-    print(f'  Restored {n} cached images in {time.time() - t0:.1f}s')
-    return True
-
-
-def save_pipeline_cache():
-    """Zip the pipeline cache to /kaggle/working/ so it appears in the notebook Output.
-
-    After the run, save the Output as a Kaggle Dataset (e.g. "<username>/pipeline-cache")
-    and mount it as Input on subsequent runs. restore_pipeline_cache() will pick it up.
-    """
-    if not PIPELINE_ENABLED or not os.path.isdir(PIPELINE_CACHE_DIR):
-        return
-    n = sum(len(files) for _, _, files in os.walk(PIPELINE_CACHE_DIR))
-    if n == 0:
-        return
-    print(f'  Zipping pipeline cache ({n} files) → {PIPELINE_CACHE_ZIP}...')
-    t0 = time.time()
-    with zipfile.ZipFile(PIPELINE_CACHE_ZIP, 'w', zipfile.ZIP_STORED) as zf:
-        for root, _, files in os.walk(PIPELINE_CACHE_DIR):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                arcname = os.path.relpath(fpath, PIPELINE_CACHE_DIR)
-                zf.write(fpath, arcname)
-    sz = os.path.getsize(PIPELINE_CACHE_ZIP) / 1e6
-    print(f'  pipeline_cache.zip ({sz:.0f} MB) saved in {time.time() - t0:.1f}s')
-    print(f'  → Save notebook Output as a Dataset, then mount it as Input on future runs.')
-
-
-def split_items_per_class(items, fractions=PAPER_SPLIT):
-    """Paper split: 70/15/15 per class."""
-    by_class = defaultdict(list)
-    for path, label in items:
-        by_class[label].append((path, label))
-    train, val, test = [], [], []
-    train_f, val_f, test_f = fractions
-    for label in sorted(by_class):
-        paths = sorted(by_class[label], key=lambda x: stable_bucket(x[0], 10 ** 9))
-        n = len(paths)
-        n_train = int(round(n * train_f))
-        n_val = int(round(n * val_f))
-        train += paths[:n_train]
-        val += paths[n_train:n_train + n_val]
-        test += paths[n_train + n_val:]
-    return train, val, test
-
-
-def save_lime_explanations(model, items, tag, num_samples=LIME_SAMPLES):
-    """Paper stage 4: LIME attribution maps for sample predictions."""
-    try:
-        from lime import lime_image
-        from skimage.segmentation import mark_boundaries
-    except ImportError:
-        print('  LIME unavailable (pip install lime scikit-image) — skipping explainability plots')
-        return
-    if not items:
-        return
-    explainer = lime_image.LimeImageExplainer()
-    out_dir = f'{WORK}/lime_{tag}'
-    os.makedirs(out_dir, exist_ok=True)
-    rng = np.random.default_rng(SEED)
-    picks = items if len(items) <= num_samples else [
-        items[i] for i in rng.choice(len(items), size=num_samples, replace=False)]
-    for i, (path, label) in enumerate(picks):
-        try:
-            pil = Image.open(path).convert('RGB').resize(
-                (CLASSIFIER_IMG_SIZE, CLASSIFIER_IMG_SIZE), Image.BILINEAR)
-            arr = np.asarray(pil, dtype=np.float32)
-            if PIPELINE_CLASSIFIER == 'resnet50':
-                arr = arr / 255.0
-            else:
-                arr = arr  # 0..255 for EfficientNet path
-
-            def _predict_fn(images):
-                batch = []
-                for im in images:
-                    x = im.astype(np.float32)
-                    if PIPELINE_CLASSIFIER != 'resnet50':
-                        x = x  # keep 0..255
-                    batch.append(x)
-                xb = np.stack(batch, axis=0)
-                if PIPELINE_CLASSIFIER != 'resnet50':
-                    return model.predict(xb, verbose=0)
-                return model.predict(xb * 255.0 if xb.max() <= 1.0 else xb, verbose=0)
-
-            explanation = explainer.explain_instance(
-                arr.astype(np.double), _predict_fn,
-                top_labels=1, hide_color=0, num_samples=800)
-            top = explanation.top_labels[0]
-            temp, mask = explanation.get_image_and_mask(
-                top, positive_only=True, num_features=LIME_NUM_FEATURES, hide_rest=True)
-            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-            axes[0].imshow(arr.astype(np.uint8) if arr.max() > 1.0 else (arr * 255).astype(np.uint8))
-            axes[0].set_title(f'True: {class_names[label]}')
-            axes[0].axis('off')
-            axes[1].imshow(mark_boundaries(temp / 255.0 if temp.max() > 1.0 else temp, mask))
-            axes[1].set_title(f'LIME → {class_names[top]}')
-            axes[1].axis('off')
-            fig.suptitle(f'{tag} sample {i + 1}')
-            fig.tight_layout()
-            fig.savefig(f'{out_dir}/sample_{i + 1}.png', dpi=150)
-            plt.close(fig)
-        except Exception as exc:
-            print(f'  LIME sample {i + 1} failed: {exc}')
-    print(f'  LIME maps saved -> {out_dir}/')
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(nbytes)
+        return hashlib.md5(head + str(size).encode()).hexdigest()
+    except OSError:
+        return None
 
 
 def find_input(*hints, must_contain=()):
-    """Shallowest deterministic match under /kaggle/input."""
-    base = '/kaggle/input'
+    base = "/kaggle/input"
     if not os.path.isdir(base):
         return None
     matches = []
@@ -703,76 +265,82 @@ def image_files(folder):
         return []
 
 
-# ------------------------------------------------- label harmonisation -----
-FILLER = {'leaf', 'leaves', 'plant', 'plants', 'image', 'images', 'photo', 'photos',
-          'disease', 'diseased', 'dataset', 'class', 'train', 'folder'}
-TOKEN_SYNONYMS = {'normal': 'healthy', 'fresh': 'healthy', 'mould': 'mold'}
+# ================================================ label harmonisation ======
+FILLER = {
+    "leaf",
+    "leaves",
+    "plant",
+    "plants",
+    "image",
+    "images",
+    "photo",
+    "photos",
+    "disease",
+    "diseased",
+    "dataset",
+    "class",
+    "train",
+    "folder",
+}
+TOKEN_SYNONYMS = {"normal": "healthy", "fresh": "healthy", "mould": "mold"}
 
 
 def _key(text):
-    """'Tomato Early blight leaf' -> 'tomato early blight'."""
-    text = text.replace('___', ' ').replace('+', ' ').replace(',', ' ')
-    words = re.sub(r'[^a-z0-9]+', ' ', text.lower()).split()
+    text = text.replace("___", " ").replace("+", " ").replace(",", " ")
+    words = re.sub(r"[^a-z0-9]+", " ", text.lower()).split()
     words = [TOKEN_SYNONYMS.get(w, w) for w in words]
-    words = ' '.join(words).split()
     kept = [w for w in words if w not in FILLER]
-    return ' '.join(kept or words)
+    return " ".join(kept or words)
 
 
-# cookiefinder/tomato-disease-multiple-sources folder names -> PlantVillage classes.
 TOMATO_ALIASES = {
-    'Bacterial_spot': 'Tomato___Bacterial_spot',
-    'Early_blight': 'Tomato___Early_blight',
-    'Late_blight': 'Tomato___Late_blight',
-    'Leaf_Mold': 'Tomato___Leaf_Mold',
-    'Septoria_leaf_spot': 'Tomato___Septoria_leaf_spot',
-    'Spider_mites Two-spotted_spider_mite': 'Tomato___Spider_mites Two-spotted_spider_mite',
-    'Target_Spot': 'Tomato___Target_Spot',
-    'Tomato_Yellow_Leaf_Curl_Virus': 'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
-    'Tomato_mosaic_virus': 'Tomato___Tomato_mosaic_virus',
-    'healthy': 'Tomato___healthy',
+    "Bacterial_spot": "Tomato___Bacterial_spot",
+    "Early_blight": "Tomato___Early_blight",
+    "Late_blight": "Tomato___Late_blight",
+    "Leaf_Mold": "Tomato___Leaf_Mold",
+    "Septoria_leaf_spot": "Tomato___Septoria_leaf_spot",
+    "Spider_mites Two-spotted_spider_mite": "Tomato___Spider_mites Two-spotted_spider_mite",
+    "Target_Spot": "Tomato___Target_Spot",
+    "Tomato_Yellow_Leaf_Curl_Virus": "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
+    "Tomato_mosaic_virus": "Tomato___Tomato_mosaic_virus",
+    "healthy": "Tomato___healthy",
 }
-
-# PlantDoc folder names -> tomato PlantVillage classes.
 PLANTDOC_ALIASES = {
-    'Tomato Early blight leaf': 'Tomato___Early_blight',
-    'Tomato Septoria leaf spot': 'Tomato___Septoria_leaf_spot',
-    'Tomato leaf': 'Tomato___healthy',
-    'Tomato leaf bacterial spot': 'Tomato___Bacterial_spot',
-    'Tomato leaf late blight': 'Tomato___Late_blight',
-    'Tomato leaf mosaic virus': 'Tomato___Tomato_mosaic_virus',
-    'Tomato leaf yellow virus': 'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
-    'Tomato mold leaf': 'Tomato___Leaf_Mold',
-    'Tomato two spotted spider mites leaf': 'Tomato___Spider_mites Two-spotted_spider_mite',
+    "Tomato Early blight leaf": "Tomato___Early_blight",
+    "Tomato Septoria leaf spot": "Tomato___Septoria_leaf_spot",
+    "Tomato leaf": "Tomato___healthy",
+    "Tomato leaf bacterial spot": "Tomato___Bacterial_spot",
+    "Tomato leaf late blight": "Tomato___Late_blight",
+    "Tomato leaf mosaic virus": "Tomato___Tomato_mosaic_virus",
+    "Tomato leaf yellow virus": "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
+    "Tomato mold leaf": "Tomato___Leaf_Mold",
+    "Tomato two spotted spider mites leaf": "Tomato___Spider_mites Two-spotted_spider_mite",
 }
-
 TOMATO_TOKEN_ALIASES = {
-    'tomato spider mite': 'Tomato___Spider_mites Two-spotted_spider_mite',
-    'tomato spider mites': 'Tomato___Spider_mites Two-spotted_spider_mite',
-    'tomato two spotted spider mite': 'Tomato___Spider_mites Two-spotted_spider_mite',
+    "tomato spider mite": "Tomato___Spider_mites Two-spotted_spider_mite",
+    "tomato spider mites": "Tomato___Spider_mites Two-spotted_spider_mite",
+    "tomato two spotted spider mite": "Tomato___Spider_mites Two-spotted_spider_mite",
 }
 
 
 def _pv_tokens(pv_class):
-    plant, disease = pv_class.split('___', 1)
-    p = set(_key(plant).split())
-    d = set(_key(disease).split())
-    return p, d
+    plant, disease = pv_class.split("___", 1)
+    return set(_key(plant).split()), set(_key(disease).split())
 
 
-def build_mapping(root, class_names, aliases=None, tag=''):
-    """folder name -> tomato class. Every decision is written to a CSV for audit."""
+def build_mapping(root, aliases=None, tag=""):
     table = {_key(k): v for k, v in (aliases or {}).items()}
-    table.update({k: v for k, v in TOMATO_TOKEN_ALIASES.items()})
-    pv_tokens = {c: _pv_tokens(c) for c in class_names}
-
+    table.update(TOMATO_TOKEN_ALIASES)
+    pv_tokens = {c: _pv_tokens(c) for c in TOMATO_CLASSES}
     mapping, rows = {}, []
-    for folder in sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))):
+    for folder in sorted(
+        d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
+    ):
         key = _key(folder)
         tokens = set(key.split())
         how, hit = None, table.get(key)
-        if hit in class_names:
-            how = 'alias'
+        if hit in TOMATO_CLASSES:
+            how = "alias"
         else:
             best, best_score, tie = None, 0, False
             for pv, (p, d) in pv_tokens.items():
@@ -787,281 +355,675 @@ def build_mapping(root, class_names, aliases=None, tag=''):
                     best, best_score, tie = pv, score, False
                 elif score == best_score:
                     tie = True
-            hit, how = (None, 'ambiguous') if tie else (best, f'tokens({best_score})' if best else None)
+            hit, how = (
+                (None, "ambiguous")
+                if tie
+                else (best, f"tokens({best_score})" if best else None)
+            )
         if hit:
             mapping[folder] = hit
-        rows.append({'folder': folder, 'key': key, 'mapped_to': hit or '', 'how': how or 'UNMAPPED'})
-
-    out = f'{WORK}/mapping_{tag}.csv'
-    pd.DataFrame(rows).to_csv(out, index=False)
-    dropped = [r['folder'] for r in rows if not r['mapped_to']]
-    print(f'  {tag}: mapped {len(mapping)}/{len(rows)} folders -> {out}')
+        rows.append(
+            {
+                "folder": folder,
+                "key": key,
+                "mapped_to": hit or "",
+                "how": how or "UNMAPPED",
+            }
+        )
+    pd.DataFrame(rows).to_csv(f"{WORK}/mapping_{tag}.csv", index=False)
+    dropped = [r["folder"] for r in rows if not r["mapped_to"]]
+    print(f"  {tag}: mapped {len(mapping)}/{len(rows)} folders")
     if dropped:
-        print(f'  {tag}: {len(dropped)} unmapped folders skipped: {dropped[:8]}')
+        print(f"  {tag}: skipped {len(dropped)} unmapped: {dropped[:6]}")
     return mapping
 
 
-# -------------------------------------------------------- file indexing -----
-def collect(root, mapping, class_index, cap=MAX_PER_SOURCE_FOLDER,
-            val_fraction=0.0, skip_hashes=None, tag=''):
-    """Index a source directory. Returns (train_items, val_items) of (path, class_idx)."""
+def collect(root, mapping, val_fraction=0.0, skip_hashes=None, tag=""):
     train, val, leaked = [], [], 0
     val_cut = int(round(val_fraction * 100))
     for folder, cls in sorted(mapping.items()):
         fdir = os.path.join(root, folder)
-        files = image_files(fdir)
-        if cap and len(files) > cap:
-            files = sorted(files, key=lambda f: stable_bucket(folder + f, 10 ** 9))[:cap]
-        for fname in files:
+        for fname in image_files(fdir):
             path = os.path.join(fdir, fname)
             if skip_hashes:
-                try:
-                    if file_md5(path) in skip_hashes:
-                        leaked += 1
-                        continue
-                except OSError:
+                h = fast_hash(path)
+                if h and h in skip_hashes:
+                    leaked += 1
                     continue
-            item = (path, class_index[cls])
-            (val if val_cut and stable_bucket(folder + fname) < val_cut else train).append(item)
-    note = f', val={len(val)}' if val else ''
-    note += f', leakage_removed={leaked}' if leaked else ''
-    print(f'  {tag}: {len(train)} train images{note}')
+            item = (path, CLASS_INDEX[cls])
+            (
+                val if val_cut and stable_bucket(folder + fname) < val_cut else train
+            ).append(item)
+    note = f", val={len(val)}" if val else ""
+    note += f", leakage_removed={leaked}" if leaked else ""
+    print(f"  {tag}: {len(train)} train images{note}")
     return train, val
 
 
-def find_class_root(base, class_names, max_depth=3):
-    """Locate the directory whose children are class folders (datasets nest differently)."""
+def dedup_and_cap(items, cap=None, tag=""):
+    """Drop byte-identical duplicates across lab sources, then cap per class."""
+    if DEDUP_LAB:
+        seen, kept = set(), []
+        for path, lab in items:
+            h = fast_hash(path)
+            if h is None or h in seen:
+                continue
+            seen.add(h)
+            kept.append((path, lab))
+        removed = len(items) - len(kept)
+        if removed:
+            print(f"  {tag}: removed {removed} duplicate images")
+        items = kept
+    if cap:
+        by_class = defaultdict(list)
+        for path, lab in items:
+            by_class[lab].append((path, lab))
+        out = []
+        for lab in sorted(by_class):
+            group = sorted(by_class[lab], key=lambda x: stable_bucket(x[0], 10**9))
+            out += group[:cap]
+        if len(out) < len(items):
+            print(f"  {tag}: capped {len(items)} -> {len(out)} (max {cap}/class)")
+        items = out
+    return items
+
+
+def find_class_root(base, max_depth=3):
     best, best_score = base, 0
-    base_depth = base.rstrip('/').count(os.sep)
+    base_depth = base.rstrip("/").count(os.sep)
     for root, dirs, _ in os.walk(base):
         dirs.sort()
-        if root.rstrip('/').count(os.sep) - base_depth >= max_depth:
+        if root.rstrip("/").count(os.sep) - base_depth >= max_depth:
             dirs[:] = []
             continue
         score = sum(1 for d in dirs if image_files(os.path.join(root, d)))
-        if 'train' in os.path.basename(root).lower():
+        if "train" in os.path.basename(root).lower():
             score += 1
         if score > best_score:
             best, best_score = root, score
     return best
 
 
-def tomato_pv_mapping(pv_train_root):
-    """PlantVillage train folders that belong to the tomato taxonomy."""
-    available = {d for d in os.listdir(pv_train_root) if os.path.isdir(os.path.join(pv_train_root, d))}
-    missing = [c for c in TOMATO_CLASSES if c not in available]
-    if missing:
-        raise RuntimeError(f'PlantVillage is missing tomato classes: {missing}')
-    return {c: c for c in TOMATO_CLASSES}
+def split_items_per_class(items, fractions=PAPER_SPLIT):
+    by_class = defaultdict(list)
+    for path, label in items:
+        by_class[label].append((path, label))
+    train, val, test = [], [], []
+    tf_, vf_, _ = fractions
+    for label in sorted(by_class):
+        paths = sorted(by_class[label], key=lambda x: stable_bucket(x[0], 10**9))
+        n = len(paths)
+        n_tr, n_va = int(round(n * tf_)), int(round(n * vf_))
+        train += paths[:n_tr]
+        val += paths[n_tr : n_tr + n_va]
+        test += paths[n_tr + n_va :]
+    return train, val, test
 
 
-# ================================================== 1. locate the datasets ==
-print('=== 1. Datasets (tomato-only) ===')
-disk_free('start')
+# ===================================================== isolation cache =====
+_pipeline_stats = defaultdict(int)
 
-TOMATO_DIR = find_input('tomato-disease-multiple', 'tomato-disease', must_contain=('train',))
+
+def cache_relpath(src_path, tag):
+    """Path scheme kept BYTE-IDENTICAL to the old script so existing caches still resolve."""
+    parts = os.path.normpath(src_path).split(os.sep)
+    rel = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else parts[-1]
+    rel = re.sub(r"[?&]", "_", rel)
+    rel = re.sub(r"\s+\.", ".", rel)
+    rel = os.path.splitext(rel)[0] + ".jpg"
+    return os.path.join(tag or "shared", rel)
+
+
+def discover_cache_roots():
+    roots = []
+    if os.path.isdir(PIPELINE_CACHE_DIR):
+        roots.append(PIPELINE_CACHE_DIR)
+    if PIPELINE_CACHE_INPUT_PATH and os.path.isdir(PIPELINE_CACHE_INPUT_PATH):
+        roots.append(PIPELINE_CACHE_INPUT_PATH)
+    candidates = glob.glob("/kaggle/input/*") + glob.glob("/kaggle/input/*/*")
+    for cand in sorted(candidates):
+        if not os.path.isdir(cand) or cand in roots:
+            continue
+        if sum(os.path.isdir(os.path.join(cand, t)) for t in CACHE_TAGS) >= 2:
+            roots.append(cand)
+    seen, out = set(), []
+    for r in roots:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+CACHE_ROOTS = discover_cache_roots() if ISOLATION_MODE != "off" else []
+if CACHE_ROOTS:
+    print("Isolation cache roots:", CACHE_ROOTS)
+elif ISOLATION_MODE != "off":
+    print(
+        "No isolation cache found — running raw-only (still fine, just no iso channel)."
+    )
+
+
+def lookup_iso(src_path, tag):
+    rel = cache_relpath(src_path, tag)
+    for root in CACHE_ROOTS:
+        cand = os.path.join(root, rel)
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+_iso_manifest = {}
+if os.path.isfile(ISO_MANIFEST):
+    try:
+        _iso_manifest = json.load(open(ISO_MANIFEST))
+    except Exception:
+        _iso_manifest = {}
+
+
+def iso_quality_ok(path):
+    """Reject cache entries where segmentation erased the leaf or produced junk."""
+    if path in _iso_manifest:
+        return _iso_manifest[path]
+    ok = False
+    try:
+        with Image.open(path) as im:
+            im.draft("RGB", (64, 64))
+            a = np.asarray(im.convert("RGB").resize((64, 64)), dtype=np.float32) / 255.0
+        white = float((a.min(axis=-1) > BG_WHITE_THRESH).mean())
+        ok = bool(white <= MAX_WHITE_FRACTION and a.std() > 0.02)
+    except Exception:
+        ok = False
+    _iso_manifest[path] = ok
+    return ok
+
+
+def attach_iso(items, tag, verbose=True):
+    """(path, label) -> (raw_path, iso_path_or_empty, label), with quality screening."""
+    if ISOLATION_MODE == "off" or not CACHE_ROOTS:
+        return [(p, "", l) for p, l in items]
+    out, hit, rejected = [], 0, 0
+    t0 = time.time()
+    for i, (p, l) in enumerate(items):
+        iso = lookup_iso(p, tag)
+        if iso:
+            if iso_quality_ok(iso):
+                hit += 1
+            else:
+                rejected += 1
+                iso = ""
+        out.append((p, iso, l))
+        if verbose and (i + 1) % 5000 == 0:
+            print(
+                f"    iso-index [{tag}] {i + 1}/{len(items)} ({time.time() - t0:.0f}s)",
+                flush=True,
+            )
+    if verbose:
+        print(
+            f"  iso[{tag}]: {hit}/{len(items)} usable, {rejected} rejected by quality filter"
+        )
+    return out
+
+
+def save_iso_manifest():
+    try:
+        json.dump(_iso_manifest, open(ISO_MANIFEST, "w"))
+    except Exception:
+        pass
+
+
+# ---------- isolator (only needed when BUILD_CACHE_ONLY / rebuilding) ------
+_yolo_model = None
+_sam_predictor = None
+
+
+def _load_yolo():
+    global _yolo_model
+    if _yolo_model is not None:
+        return _yolo_model
+    if not USE_YOLO:
+        _yolo_model = False
+        return _yolo_model
+    try:
+        from ultralytics import YOLO
+
+        roboflow = find_input("roboflow", "leaf-detection", "plant-leaf")
+        weights = YOLO_WEIGHTS
+        if roboflow:
+            data_yaml = None
+            for root, _, files in os.walk(roboflow):
+                for fn in files:
+                    if fn.endswith((".yaml", ".yml")):
+                        data_yaml = os.path.join(root, fn)
+                        break
+                if data_yaml:
+                    break
+            if data_yaml:
+                print(f"  Fine-tuning YOLO on {data_yaml}...")
+                m = YOLO(YOLO_WEIGHTS)
+                m.train(
+                    data=data_yaml,
+                    imgsz=YOLO_IMGSZ,
+                    epochs=YOLO_TRAIN_EPOCHS,
+                    batch=16,
+                    cos_lr=True,
+                    project=f"{WORK}/yolo_leaf",
+                    name="train",
+                    exist_ok=True,
+                    verbose=False,
+                )
+                best = f"{WORK}/yolo_leaf/train/weights/best.pt"
+                weights = best if os.path.isfile(best) else YOLO_WEIGHTS
+            else:
+                print(
+                    "  Roboflow folder has no data.yaml — YOLO disabled (COCO boxes are harmful)"
+                )
+                _yolo_model = False
+                return _yolo_model
+        else:
+            print(
+                "  No leaf-detection dataset — YOLO disabled (COCO boxes are harmful)"
+            )
+            _yolo_model = False
+            return _yolo_model
+        _yolo_model = YOLO(weights)
+    except Exception as exc:
+        print(f"  YOLO unavailable ({exc})")
+        _yolo_model = False
+    return _yolo_model
+
+
+def ensure_sam():
+    global _sam_predictor, SAM_CHECKPOINT
+    if _sam_predictor is not None:
+        return _sam_predictor
+    if SEGMENTATION_BACKEND != "sam":
+        _sam_predictor = False
+        return _sam_predictor
+    try:
+        try:
+            importlib.import_module("segment_anything")
+        except ImportError:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "-q", f"git+{SAM_REPO}"]
+            )
+        import torch
+        from segment_anything import SamPredictor, sam_model_registry
+
+        ckpt = SAM_CHECKPOINT
+        if not (os.path.isfile(ckpt) and os.path.getsize(ckpt) > 1_000_000):
+            mounted = find_input("sam", "segment-anything")
+            found = None
+            if mounted:
+                for root, _, files in os.walk(mounted):
+                    for fn in files:
+                        if fn.endswith(".pth") and "vit_b" in fn:
+                            found = os.path.join(root, fn)
+            if found:
+                ckpt = found
+            elif AUTO_DOWNLOAD_SAM:
+                import urllib.request
+
+                print("  Downloading SAM vit_b (~375 MB)...")
+                urllib.request.urlretrieve(SAM_WEIGHTS_URL, SAM_CHECKPOINT)
+                ckpt = SAM_CHECKPOINT
+            else:
+                _sam_predictor = False
+                return _sam_predictor
+        SAM_CHECKPOINT = ckpt
+        sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=ckpt)
+        sam.to("cuda" if torch.cuda.is_available() else "cpu")
+        _sam_predictor = SamPredictor(sam)
+        print(f"  SAM ready ({ckpt})")
+    except Exception as exc:
+        print(f"  SAM unavailable ({exc}) — falling back to GrabCut/raw")
+        _sam_predictor = False
+    return _sam_predictor
+
+
+def _expand_box(box, w, h, margin=BOX_MARGIN):
+    x1, y1, x2, y2 = box
+    dw, dh = (x2 - x1) * margin, (y2 - y1) * margin
+    return (
+        max(0, int(x1 - dw)),
+        max(0, int(y1 - dh)),
+        min(w, int(x2 + dw)),
+        min(h, int(y2 + dh)),
+    )
+
+
+def _detect_leaf(pil_img):
+    model = _load_yolo()
+    if not model:
+        return pil_img
+    w, h = pil_img.size
+    try:
+        res = model.predict(
+            np.asarray(pil_img), imgsz=YOLO_IMGSZ, conf=YOLO_CONF, verbose=False
+        )
+    except Exception:
+        return pil_img
+    if not res or res[0].boxes is None or len(res[0].boxes) == 0:
+        _pipeline_stats["yolo_miss"] += 1
+        return pil_img
+    boxes = res[0].boxes.xyxy.cpu().numpy()
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    frac = areas / float(w * h)
+    valid = np.where((frac > 0.03) & (frac < 0.98))[0]
+    if len(valid) == 0:
+        _pipeline_stats["yolo_miss"] += 1
+        return pil_img
+    box = boxes[valid[int(areas[valid].argmax())]]
+    _pipeline_stats["yolo_detect"] += 1
+    return pil_img.crop(_expand_box(box, w, h))
+
+
+def _grabcut_mask(arr):
+    if cv2 is None:
+        return None
+    h, w = arr.shape[:2]
+    mask = np.zeros((h, w), np.uint8)
+    m = max(2, int(min(h, w) * 0.06))
+    try:
+        cv2.grabCut(
+            arr,
+            mask,
+            (m, m, w - 2 * m, h - 2 * m),
+            np.zeros((1, 65), np.float64),
+            np.zeros((1, 65), np.float64),
+            3,
+            cv2.GC_INIT_WITH_RECT,
+        )
+    except Exception:
+        return None
+    return np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(
+        np.uint8
+    )
+
+
+def _sam_mask(arr):
+    predictor = ensure_sam()
+    if not predictor:
+        return None
+    h, w = arr.shape[:2]
+    try:
+        predictor.set_image(arr)
+        m = int(min(h, w) * 0.08)
+        box = np.array([m, m, w - m, h - m], dtype=np.float32)
+        pts = np.array(
+            [[w // 2, h // 2], [w // 2, h // 3], [w // 2, 2 * h // 3]], dtype=np.float32
+        )
+        lbl = np.ones(len(pts), dtype=np.int32)
+        masks, scores, _ = predictor.predict(
+            point_coords=pts, point_labels=lbl, box=box, multimask_output=True
+        )
+    except Exception:
+        return None
+    best, best_score = None, -1.0
+    cy, cx = h // 2, w // 2
+    for mk, sc in zip(masks, scores):
+        mk = mk.astype(np.uint8)
+        area = mk.mean()
+        if not (MASK_MIN_AREA <= area <= MASK_MAX_AREA):
+            continue
+        if mk[cy, cx] == 0:  # must cover the image centre
+            continue
+        if sc > best_score:
+            best, best_score = mk, float(sc)
+    return best
+
+
+def isolate_leaf_image(pil_img):
+    """Detect (optional) -> segment -> white background. Falls back to the raw crop."""
+    crop = _detect_leaf(pil_img)
+    if SEGMENTATION_BACKEND == "none":
+        return crop
+    arr = np.asarray(crop.convert("RGB"))
+    mask = _sam_mask(arr) if SEGMENTATION_BACKEND == "sam" else None
+    if mask is None:
+        mask = _grabcut_mask(arr)
+        if mask is not None:
+            _pipeline_stats["grabcut"] += 1
+    else:
+        _pipeline_stats["sam"] += 1
+    if mask is None or not (MASK_MIN_AREA <= mask.mean() <= MASK_MAX_AREA):
+        _pipeline_stats["mask_reject"] += 1
+        return crop
+    ys, xs = np.where(mask > 0)
+    y1, y2, x1, x2 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    pad_y, pad_x = int((y2 - y1) * 0.06), int((x2 - x1) * 0.06)
+    y1, y2 = max(0, y1 - pad_y), min(arr.shape[0], y2 + pad_y)
+    x1, x2 = max(0, x1 - pad_x), min(arr.shape[1], x2 + pad_x)
+    out = np.where(mask[..., None] > 0, arr, np.full_like(arr, 255))
+    return Image.fromarray(out[y1:y2, x1:x2].astype(np.uint8))
+
+
+def build_cache(items, tag):
+    out_dir = os.path.join(PIPELINE_CACHE_DIR, tag)
+    os.makedirs(out_dir, exist_ok=True)
+    t0, done = time.time(), 0
+    for i, (src, _lab) in enumerate(items):
+        dst = os.path.join(PIPELINE_CACHE_DIR, cache_relpath(src, tag))
+        if not PIPELINE_REBUILD_CACHE and os.path.isfile(dst):
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        try:
+            isolate_leaf_image(Image.open(src).convert("RGB")).save(dst, quality=95)
+        except Exception:
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
+        done += 1
+        if done % 200 == 0:
+            rate = done / max(time.time() - t0, 1e-3)
+            print(f"  cache[{tag}] {i + 1}/{len(items)} — {rate:.1f} img/s", flush=True)
+    print(f"  cache[{tag}] complete ({done} new)")
+
+
+def zip_cache():
+    n = sum(len(f) for _, _, f in os.walk(PIPELINE_CACHE_DIR))
+    if not n:
+        return
+    print(f"  Zipping {n} cached images...")
+    with zipfile.ZipFile(PIPELINE_CACHE_ZIP, "w", zipfile.ZIP_STORED) as zf:
+        for root, _, files in os.walk(PIPELINE_CACHE_DIR):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                zf.write(fp, os.path.relpath(fp, PIPELINE_CACHE_DIR))
+    print(
+        f"  {PIPELINE_CACHE_ZIP} ({os.path.getsize(PIPELINE_CACHE_ZIP) / 1e6:.0f} MB)"
+    )
+
+
+# ============================================== 1. locate the datasets =====
+print("=== 1. Datasets ===")
+disk_free("start")
+
+TOMATO_DIR = find_input(
+    "tomato-disease-multiple", "tomato-disease", must_contain=("train",)
+)
 if TOMATO_DIR is None:
-    print('Tomato Disease Multiple Sources not mounted — downloading (needs internet + kaggle.json)...')
-    kaggle_download('cookiefinder/tomato-disease-multiple-sources', f'{WORK}/tomato')
-    TOMATO_DIR = find_input('tomato-disease-multiple', 'tomato-disease', must_contain=('train',)) or f'{WORK}/tomato'
-tom_root = os.path.join(TOMATO_DIR, 'train')
+    print("Tomato multi-source not mounted — downloading...")
+    kaggle_download("cookiefinder/tomato-disease-multiple-sources", f"{WORK}/tomato")
+    TOMATO_DIR = (
+        find_input("tomato-disease-multiple", "tomato-disease", must_contain=("train",))
+        or f"{WORK}/tomato"
+    )
+tom_root = os.path.join(TOMATO_DIR, "train")
 if not os.path.isdir(tom_root):
-    tom_root = find_class_root(TOMATO_DIR, TOMATO_CLASSES)
-if not os.path.isdir(tom_root):
-    raise RuntimeError('Tomato Disease Multiple Sources train/ not found — mount '
-                       '"Tomato Disease Multiple Sources" as a Kaggle Input.')
+    tom_root = find_class_root(TOMATO_DIR)
 
 PV_TRAIN = PV_VALID = None
-pv_root = find_input('new-plant-diseases', 'plant-diseases', 'plantvillage')
-for base in filter(None, [pv_root, f'{WORK}/data']):
+for base in filter(
+    None,
+    [
+        find_input("new-plant-diseases", "plant-diseases", "plantvillage"),
+        f"{WORK}/data",
+    ],
+):
     for root, dirs, _ in os.walk(base):
         dirs.sort()
-        if 'train' in dirs and 'valid' in dirs:
-            PV_TRAIN, PV_VALID = os.path.join(root, 'train'), os.path.join(root, 'valid')
+        if "train" in dirs and "valid" in dirs:
+            PV_TRAIN, PV_VALID = os.path.join(root, "train"), os.path.join(
+                root, "valid"
+            )
             break
     if PV_TRAIN:
         break
 if PV_TRAIN is None:
-    print('PlantVillage not mounted — downloading (needs internet + kaggle.json)...')
-    kaggle_download('vipoooool/new-plant-diseases-dataset', f'{WORK}/data')
-    for root, dirs, _ in os.walk(f'{WORK}/data'):
+    print("PlantVillage not mounted — downloading...")
+    kaggle_download("vipoooool/new-plant-diseases-dataset", f"{WORK}/data")
+    for root, dirs, _ in os.walk(f"{WORK}/data"):
         dirs.sort()
-        if 'train' in dirs and 'valid' in dirs:
-            PV_TRAIN, PV_VALID = os.path.join(root, 'train'), os.path.join(root, 'valid')
+        if "train" in dirs and "valid" in dirs:
+            PV_TRAIN, PV_VALID = os.path.join(root, "train"), os.path.join(
+                root, "valid"
+            )
             break
 if not (PV_TRAIN and os.path.isdir(PV_TRAIN)):
-    raise RuntimeError('PlantVillage train/valid not found — mount "New Plant Diseases Dataset '
-                       '(Augmented)" as a Kaggle Input.')
+    raise RuntimeError("PlantVillage train/valid not found.")
 
-PD_DIR = find_input('plantdoc', must_contain=('train', 'test')) or f'{WORK}/plantdoc'
-if not os.path.isdir(os.path.join(PD_DIR, 'train')):
-    git_clone('https://github.com/pratikkayal/PlantDoc-Dataset.git', PD_DIR)
-PD_TRAIN, PD_TEST = os.path.join(PD_DIR, 'train'), os.path.join(PD_DIR, 'test')
+PD_DIR = find_input("plantdoc", must_contain=("train", "test")) or f"{WORK}/plantdoc"
+if not os.path.isdir(os.path.join(PD_DIR, "train")):
+    git_clone("https://github.com/pratikkayal/PlantDoc-Dataset.git", PD_DIR)
+PD_TRAIN, PD_TEST = os.path.join(PD_DIR, "train"), os.path.join(PD_DIR, "test")
 if not os.path.isdir(PD_TEST):
-    raise RuntimeError('PlantDoc unavailable — enable internet or mount it as a Kaggle Input.')
+    raise RuntimeError("PlantDoc unavailable.")
 
-class_names = TOMATO_CLASSES
-with open(f'{WORK}/class_names.json', 'w') as f:
-    json.dump(class_names, f, indent=2)
-
-print(f'Tomato train : {tom_root}')
-print(f'PlantVillage : {PV_TRAIN} (lab supplement + valid eval)')
-print(f'PlantDoc     : {PD_DIR} (field train + val early-stop + test eval)')
+json.dump(class_names, open(f"{WORK}/class_names.json", "w"), indent=2)
+print(f"Tomato : {tom_root}\nPV     : {PV_TRAIN}\nPD     : {PD_DIR}")
 
 
-# ============================================== 2. build the file indexes ==
-print('\n=== 2. Index images ===')
-lab_items, field_items, val_items = [], [], []
+# ================================================ 2. index the images ======
+print("\n=== 2. Index ===")
+lab_raw = []
+lab_raw += collect(
+    tom_root, build_mapping(tom_root, TOMATO_ALIASES, "tomato"), tag="tomato-primary"
+)[0]
+pv_avail = {d for d in os.listdir(PV_TRAIN) if os.path.isdir(os.path.join(PV_TRAIN, d))}
+missing = [c for c in TOMATO_CLASSES if c not in pv_avail]
+if missing:
+    raise RuntimeError(f"PlantVillage missing: {missing}")
+pv_map = {c: c for c in TOMATO_CLASSES}
+lab_raw += collect(PV_TRAIN, pv_map, tag="plantvillage-train")[0]
+lab_raw = dedup_and_cap(lab_raw, cap=MAX_PER_CLASS_LAB, tag="lab")
 
-tom_map = build_mapping(tom_root, class_names, TOMATO_ALIASES, tag='tomato-primary')
-train, _ = collect(tom_root, tom_map, CLASS_INDEX, cap=None, tag='tomato-primary')
-lab_items += train
-
-pv_map = tomato_pv_mapping(PV_TRAIN)
-train, _ = collect(PV_TRAIN, pv_map, CLASS_INDEX, cap=None, tag='plantvillage-tomato-train')
-lab_items += train
-
-print('Hashing PlantDoc test to block train/test leakage...')
+print("Hashing PlantDoc test (leakage guard)...")
 pd_test_hashes = set()
 for folder in sorted(os.listdir(PD_TEST)):
     for f in image_files(os.path.join(PD_TEST, folder)):
-        try:
-            pd_test_hashes.add(file_md5(os.path.join(PD_TEST, folder, f)))
-        except OSError:
-            pass
+        h = fast_hash(os.path.join(PD_TEST, folder, f))
+        if h:
+            pd_test_hashes.add(h)
 
-pd_map = build_mapping(PD_TRAIN, class_names, PLANTDOC_ALIASES, tag='plantdoc')
-train, val = collect(PD_TRAIN, pd_map, CLASS_INDEX, cap=None, val_fraction=PD_VAL_FRACTION,
-                     skip_hashes=pd_test_hashes, tag='plantdoc-train')
-field_items += train
-val_items += val
+field_raw, pdval_raw = collect(
+    PD_TRAIN,
+    build_mapping(PD_TRAIN, PLANTDOC_ALIASES, "plantdoc"),
+    val_fraction=PD_VAL_FRACTION,
+    skip_hashes=pd_test_hashes,
+    tag="plantdoc-train",
+)
+test_raw, _ = collect(
+    PD_TEST,
+    build_mapping(PD_TEST, PLANTDOC_ALIASES, "plantdoc-test"),
+    tag="plantdoc-test",
+)
+pvval_raw, _ = collect(PV_VALID, pv_map, tag="plantvillage-valid")
+pvval_raw = dedup_and_cap(
+    pvval_raw, cap=max(1, PV_EVAL_CAP // NUM_CLASSES), tag="pv-valid"
+)
 
-test_map = build_mapping(PD_TEST, class_names, PLANTDOC_ALIASES, tag='plantdoc-test')
-test_items, _ = collect(PD_TEST, test_map, CLASS_INDEX, cap=None, tag='plantdoc-test')
+if not lab_raw:
+    raise RuntimeError("No lab training images.")
+if not test_raw:
+    raise RuntimeError("PlantDoc tomato test empty after mapping.")
 
-pv_valid_items, _ = collect(PV_VALID, pv_map, CLASS_INDEX, cap=None, tag='plantvillage-valid')
+pv_test_raw = []
+if PAPER_PROTOCOL:
+    print("PAPER_PROTOCOL: PlantVillage-only training, PlantDoc strictly held out.")
+    lab_raw, pvval_raw, pv_test_raw = split_items_per_class(lab_raw, PAPER_SPLIT)
+    field_raw, pdval_raw = [], []
+    print(
+        f"  PV split: train={len(lab_raw)} val={len(pvval_raw)} test={len(pv_test_raw)}"
+    )
 
-if not lab_items:
-    raise RuntimeError('No lab training images — check tomato-disease and PlantVillage mounts.')
-if not test_items:
-    raise RuntimeError('PlantDoc tomato test is empty after mapping — check mapping_plantdoc-test.csv')
-if len(val_items) < 20:
-    print('WARNING: tiny PlantDoc val split — early stopping will be noisy.')
-
-field_by_class = defaultdict(list)
-for path, idx in field_items:
-    field_by_class[idx].append(path)
 test_support = defaultdict(int)
-for _, idx in test_items:
+for _, idx in test_raw:
     test_support[idx] += 1
 supported_idx = [i for i in range(NUM_CLASSES) if test_support[i] > 0]
-
-print(f'\nLab: {len(lab_items)} | Field: {len(field_items)} across {len(field_by_class)} classes')
-print(f'PlantDoc val: {len(val_items)} | PlantDoc test: {len(test_items)} '
-      f'({len(supported_idx)} scorable classes)')
-
-pd.DataFrame({
-    'Class': class_names,
-    'Field images': [len(field_by_class.get(i, [])) for i in range(NUM_CLASSES)],
-    'PlantDoc test support': [test_support[i] for i in range(NUM_CLASSES)],
-}).to_csv(f'{WORK}/class_coverage.csv', index=False)
+print(
+    f"\nLab={len(lab_raw)}  Field={len(field_raw)}  PDval={len(pdval_raw)}  "
+    f"PDtest={len(test_raw)} ({len(supported_idx)} scorable classes)"
+)
 
 
-# ========================================= 2b. hierarchical pipeline cache ==
-flat_lab_items = list(lab_items)
-flat_field_items = list(field_items)
-flat_val_items = list(val_items)
-flat_test_items = list(test_items)
-flat_pv_valid_items = list(pv_valid_items)
-pv_test_items = []
-
-if PIPELINE_ENABLED:
-    print('\n=== 2b. Hierarchical pipeline (YOLO11 → SAM/GrabCut → classifier) ===')
-
-    if BUILD_CACHE_ONLY:
-        # ---- MODE A: Build cache only, zip it, exit ----
-        print('BUILD_CACHE_ONLY=True — building pipeline cache and saving to output...')
-        _train_yolo_leaf_detector()
-        ensure_sam_ready()
-        _load_sam()
-
-        if PAPER_PROTOCOL:
-            print('Paper protocol: PlantVillage train/val/test only; PlantDoc held out for eval.')
-            lab_items, pv_val_split, pv_test_items = split_items_per_class(lab_items, PAPER_SPLIT)
-            pv_valid_items = pv_val_split
-            field_items, val_items = [], []
-            print(f'  PV split: train={len(lab_items)} val={len(pv_valid_items)} test={len(pv_test_items)}')
-            print(f'  PlantDoc eval-only: val={len(flat_val_items)} test={len(flat_test_items)}')
-
-        print('Caching isolated leaf images...')
-        lab_items = cache_pipeline_items(lab_items, 'lab')
-        field_items = cache_pipeline_items(field_items, 'field')
-        val_items = cache_pipeline_items(val_items, 'pd_val')
-        test_items = cache_pipeline_items(test_items, 'pd_test')
-        pv_valid_items = cache_pipeline_items(pv_valid_items, 'pv_valid')
-        if pv_test_items:
-            pv_test_items = cache_pipeline_items(pv_test_items, 'pv_test')
-        print('Pipeline stage counts:', dict(_pipeline_stats))
-        with open(f'{WORK}/pipeline_stats.json', 'w') as f:
-            json.dump(dict(_pipeline_stats), f, indent=2)
-
-        save_pipeline_cache()
-        disk_free('after cache build')
-        print('\n' + '=' * 70)
-        print('CACHE BUILD COMPLETE — no training in this mode.')
-        print('Next steps:')
-        print('  1. Save this notebook\'s Output as a Kaggle Dataset')
-        print(f'     (suggested name matches what you set in PIPELINE_CACHE_INPUT_PATH)')
-        print('  2. In a new run, mount that dataset as Input')
-        print('  3. Set BUILD_CACHE_ONLY = False and run again')
-        print('=' * 70)
-        sys.exit(0)
-
-    else:
-        # ---- MODE B: Restore cache from Input, process only missing, train ----
-        restore_pipeline_cache()
-        _train_yolo_leaf_detector()
-        ensure_sam_ready()
-        _load_sam()
-
-        if PAPER_PROTOCOL:
-            print('Paper protocol: PlantVillage train/val/test only; PlantDoc held out for eval.')
-            lab_items, pv_val_split, pv_test_items = split_items_per_class(lab_items, PAPER_SPLIT)
-            pv_valid_items = pv_val_split
-            field_items, val_items = [], []
-            print(f'  PV split: train={len(lab_items)} val={len(pv_valid_items)} test={len(pv_test_items)}')
-            print(f'  PlantDoc eval-only: val={len(flat_val_items)} test={len(flat_test_items)}')
-
-        print('Caching isolated leaf images (skips already-cached)...')
-        lab_items = cache_pipeline_items(lab_items, 'lab')
-        field_items = cache_pipeline_items(field_items, 'field')
-        val_items = cache_pipeline_items(val_items, 'pd_val')
-        test_items = cache_pipeline_items(test_items, 'pd_test')
-        pv_valid_items = cache_pipeline_items(pv_valid_items, 'pv_valid')
-        if pv_test_items:
-            pv_test_items = cache_pipeline_items(pv_test_items, 'pv_test')
-        print('Pipeline stage counts:', dict(_pipeline_stats))
-        with open(f'{WORK}/pipeline_stats.json', 'w') as f:
-            json.dump(dict(_pipeline_stats), f, indent=2)
-else:
-    print('\n=== 2b. Pipeline disabled — flat classifier mode ===')
+# ------------------------------------- optional: (re)build the cache ------
+if BUILD_CACHE_ONLY:
+    print("\n=== Cache build mode (fixed isolator) ===")
+    _load_yolo()
+    ensure_sam()
+    for items, tag in [
+        (lab_raw, "lab"),
+        (field_raw, "field"),
+        (pdval_raw, "pd_val"),
+        (test_raw, "pd_test"),
+        (pvval_raw, "pv_valid"),
+        (pv_test_raw, "pv_test"),
+    ]:
+        if items:
+            build_cache(items, tag)
+    print("Isolation stats:", dict(_pipeline_stats))
+    json.dump(dict(_pipeline_stats), open(f"{WORK}/pipeline_stats.json", "w"), indent=2)
+    zip_cache()
+    disk_free("after cache")
+    print("Done — save Output as a Dataset, then rerun with BUILD_CACHE_ONLY=False.")
+    raise SystemExit(0)
 
 
-# ================================================== 3. tf.data input pipe ==
+# -------------------------------- attach isolated variants to raw items ---
+print("\n=== 2b. Attach isolation channel ===")
+lab_items = attach_iso(lab_raw, "lab")
+field_items = attach_iso(field_raw, "field")
+val_items = attach_iso(pdval_raw, "pd_val")
+test_items = attach_iso(test_raw, "pd_test")
+pv_valid_items = attach_iso(pvval_raw, "pv_valid")
+pv_test_items = attach_iso(pv_test_raw, "pv_test") if pv_test_raw else []
+save_iso_manifest()
+
+field_by_class = defaultdict(list)
+for triple in field_items:
+    field_by_class[triple[2]].append(triple)
+
+pd.DataFrame(
+    {
+        "Class": class_names,
+        "Field images": [len(field_by_class.get(i, [])) for i in range(NUM_CLASSES)],
+        "PlantDoc test support": [test_support[i] for i in range(NUM_CLASSES)],
+    }
+).to_csv(f"{WORK}/class_coverage.csv", index=False)
+
+
+# ================================================== 3. tf.data pipeline ====
 def _decode(path):
     img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
     img.set_shape([None, None, 3])
-    return tf.image.convert_image_dtype(img, tf.float32)
+    return tf.image.convert_image_dtype(img, tf.float32)  # 0..1
 
 
 def _center_square(img):
-    """Eval/serving geometry: center square crop then resize (never squash)."""
     s = tf.minimum(tf.shape(img)[0], tf.shape(img)[1])
-    return tf.image.resize(tf.image.resize_with_crop_or_pad(img, s, s),
-                           (CLASSIFIER_IMG_SIZE, CLASSIFIER_IMG_SIZE))
+    return tf.image.resize(
+        tf.image.resize_with_crop_or_pad(img, s, s), (IMG_SIZE, IMG_SIZE)
+    )
 
 
-def _random_resized_crop(img, min_scale=0.35):
+def _pad_square(img, fill=1.0):
+    """Pad (never crop) to square with `fill` — keeps the whole isolated leaf."""
+    s = tf.maximum(tf.shape(img)[0], tf.shape(img)[1])
+    return tf.image.resize_with_crop_or_pad(img - fill, s, s) + fill
+
+
+def _random_resized_crop(img, min_scale=0.40):
     shape = tf.cast(tf.shape(img)[:2], tf.float32)
     area = shape[0] * shape[1] * tf.random.uniform([], min_scale, 1.0)
     ratio = tf.exp(tf.random.uniform([], tf.math.log(0.75), tf.math.log(1.33)))
@@ -1069,8 +1031,15 @@ def _random_resized_crop(img, min_scale=0.35):
     cw = tf.cast(tf.minimum(tf.sqrt(area * ratio), shape[1]), tf.int32)
     y = tf.random.uniform([], 0, tf.shape(img)[0] - ch + 1, tf.int32)
     x = tf.random.uniform([], 0, tf.shape(img)[1] - cw + 1, tf.int32)
-    img = tf.image.crop_to_bounding_box(img, y, x, ch, cw)
-    return tf.image.resize(img, (CLASSIFIER_IMG_SIZE, CLASSIFIER_IMG_SIZE))
+    return tf.image.resize(
+        tf.image.crop_to_bounding_box(img, y, x, ch, cw), (IMG_SIZE, IMG_SIZE)
+    )
+
+
+def _zoom_jitter(img, up=1.18):
+    big = int(IMG_SIZE * up)
+    img = tf.image.resize(img, (big, big))
+    return tf.image.random_crop(img, (IMG_SIZE, IMG_SIZE, 3))
 
 
 def _sometimes(p, fn, img):
@@ -1078,195 +1047,258 @@ def _sometimes(p, fn, img):
 
 
 def _soften(img):
-    f = tf.random.uniform([], 0.3, 0.7)
-    small = tf.cast(tf.cast(CLASSIFIER_IMG_SIZE, tf.float32) * f, tf.int32)
-    return tf.image.resize(tf.image.resize(img, (small, small)),
-                           (CLASSIFIER_IMG_SIZE, CLASSIFIER_IMG_SIZE))
+    f = tf.random.uniform([], 0.35, 0.75)
+    s = tf.cast(tf.cast(IMG_SIZE, tf.float32) * f, tf.int32)
+    return tf.image.resize(tf.image.resize(img, (s, s)), (IMG_SIZE, IMG_SIZE))
 
 
 def _noise(img):
-    return img + tf.random.normal(tf.shape(img), stddev=tf.random.uniform([], 0.01, 0.05))
+    return img + tf.random.normal(
+        tf.shape(img), stddev=tf.random.uniform([], 0.01, 0.05)
+    )
 
 
 def _erase(img):
-    eh = tf.random.uniform([], CLASSIFIER_IMG_SIZE // 10, CLASSIFIER_IMG_SIZE // 3, tf.int32)
-    ew = tf.random.uniform([], CLASSIFIER_IMG_SIZE // 10, CLASSIFIER_IMG_SIZE // 3, tf.int32)
-    y = tf.random.uniform([], 0, CLASSIFIER_IMG_SIZE - eh, tf.int32)
-    x = tf.random.uniform([], 0, CLASSIFIER_IMG_SIZE - ew, tf.int32)
-    rows = tf.range(CLASSIFIER_IMG_SIZE)[:, None]
-    cols = tf.range(CLASSIFIER_IMG_SIZE)[None, :]
-    mask = tf.cast(((rows >= y) & (rows < y + eh) & (cols >= x) & (cols < x + ew))[..., None],
-                   tf.float32)
-    return img * (1 - mask) + tf.random.uniform(tf.shape(img)) * mask
+    eh = tf.random.uniform([], IMG_SIZE // 10, IMG_SIZE // 3, tf.int32)
+    ew = tf.random.uniform([], IMG_SIZE // 10, IMG_SIZE // 3, tf.int32)
+    y = tf.random.uniform([], 0, IMG_SIZE - eh, tf.int32)
+    x = tf.random.uniform([], 0, IMG_SIZE - ew, tf.int32)
+    rows = tf.range(IMG_SIZE)[:, None]
+    cols = tf.range(IMG_SIZE)[None, :]
+    m = tf.cast(
+        ((rows >= y) & (rows < y + eh) & (cols >= x) & (cols < x + ew))[..., None],
+        tf.float32,
+    )
+    return img * (1 - m) + tf.random.uniform(tf.shape(img)) * m
 
 
-def _augment_paper(img):
-    """Paper Sec. III-E1: flip, rotation, brightness on isolated leaves."""
+def _random_bg():
+    def solid():
+        return tf.broadcast_to(
+            tf.random.uniform([1, 1, 3], 0.0, 1.0), [IMG_SIZE, IMG_SIZE, 3]
+        )
+
+    def noisy():
+        c = tf.broadcast_to(
+            tf.random.uniform([1, 1, 3], 0.0, 1.0), [IMG_SIZE, IMG_SIZE, 3]
+        )
+        return tf.clip_by_value(
+            c + tf.random.normal([IMG_SIZE, IMG_SIZE, 3], stddev=0.18), 0.0, 1.0
+        )
+
+    def blobs():
+        small = tf.random.uniform([8, 8, 3])
+        return tf.clip_by_value(
+            tf.image.resize(small, [IMG_SIZE, IMG_SIZE], method="bicubic"), 0.0, 1.0
+        )
+
+    return tf.switch_case(tf.random.uniform([], 0, 3, tf.int32), [solid, noisy, blobs])
+
+
+def _bg_randomize(img):
+    """Recover the white-fill mask from the cached image and drop in a random background."""
+    m = tf.cast(
+        tf.reduce_min(img, axis=-1, keepdims=True) > BG_WHITE_THRESH, tf.float32
+    )
+    m = tf.nn.avg_pool2d(m[None], 3, 1, "SAME")[0]  # feather the edge
+    return img * (1.0 - m) + _random_bg() * m
+
+
+def _augment_common(img):
     img = tf.image.random_flip_left_right(img)
     img = tf.image.random_flip_up_down(img)
     img = tf.image.rot90(img, tf.random.uniform([], 0, 4, tf.int32))
-    img = tf.image.random_brightness(img, 0.20)
-    img = tf.image.random_contrast(img, 0.8, 1.2)
+    img = tf.image.random_brightness(img, 0.22)
+    img = tf.image.random_contrast(img, 0.75, 1.35)
+    img = tf.image.random_saturation(img, 0.70, 1.40)
+    img = tf.image.random_hue(img, 0.03)
+    img = _sometimes(0.20, _soften, img)
+    img = _sometimes(0.20, _noise, img)
+    img = _sometimes(0.25, _erase, img)
     return tf.clip_by_value(img, 0.0, 1.0)
 
 
-def _augment(img):
-    """Domain randomisation: destroy clean-background shortcuts from lab datasets."""
-    if PIPELINE_ENABLED:
-        return _augment_paper(img)
-    img = _random_resized_crop(img)
-    img = tf.image.random_flip_left_right(img)
-    img = tf.image.random_flip_up_down(img)
-    img = tf.image.rot90(img, tf.random.uniform([], 0, 4, tf.int32))
-    img = tf.image.random_brightness(img, 0.25)
-    img = tf.image.random_contrast(img, 0.7, 1.4)
-    img = tf.clip_by_value(img, 0.0, 1.0)
-    img = tf.image.random_saturation(img, 0.6, 1.5)
-    img = tf.image.random_hue(img, 0.04)
-    img = _sometimes(0.25, _soften, img)
-    img = _sometimes(0.25, _noise, img)
-    img = _sometimes(0.30, _erase, img)
-    return tf.clip_by_value(img, 0.0, 1.0)
-
-
-def _format_classifier_input(img):
-    """ResNet-50 paper path uses [0,1]; EfficientNet path keeps 0..255."""
-    if PIPELINE_CLASSIFIER == 'resnet50':
-        return img
-    return img * 255.0
-
-
-def _load(path, label, training, isolated=None):
-    if isolated is None:
-        isolated = PIPELINE_ENABLED
-    img = _decode(path)
+def _prep_raw(img, training):
     if training:
-        if isolated:
-            img = _augment_paper(_center_square(img))
-        else:
-            img = _augment_paper(_center_square(img)) if PIPELINE_ENABLED else _augment(img)
-    else:
-        img = _center_square(img)
-    if PIPELINE_CLASSIFIER == 'resnet50':
-        return img, tf.one_hot(label, NUM_CLASSES)
-    return img * 255.0, tf.one_hot(label, NUM_CLASSES)
+        return _augment_common(_random_resized_crop(img))
+    return _center_square(img)
 
 
-def _ignore_errors(ds):
-    return ds.ignore_errors() if hasattr(ds, 'ignore_errors') \
-        else ds.apply(tf.data.experimental.ignore_errors())
+def _prep_iso(img, training):
+    img = tf.image.resize(_pad_square(img), (IMG_SIZE, IMG_SIZE))
+    if not training:
+        return img
+    img = _sometimes(BG_RANDOMIZE_PROB, _bg_randomize, img)
+    return _augment_common(_zoom_jitter(img))
 
 
-def _paths_ds(items, shuffle):
-    ds = tf.data.Dataset.from_tensor_slices(
-        (tf.constant([p for p, _ in items], dtype=tf.string), tf.constant([l for _, l in items], dtype=tf.int32)))
+def _triples_ds(items, shuffle):
+    raw = tf.constant([a for a, _, _ in items], dtype=tf.string)
+    iso = tf.constant([b for _, b, _ in items], dtype=tf.string)
+    lab = tf.constant([c for _, _, c in items], dtype=tf.int32)
+    ds = tf.data.Dataset.from_tensor_slices((raw, iso, lab))
     if shuffle:
-        ds = ds.shuffle(min(len(items), 20000), seed=SEED, reshuffle_each_iteration=True).repeat()
+        ds = ds.shuffle(
+            min(len(items), 20000), seed=SEED, reshuffle_each_iteration=True
+        ).repeat()
     return ds
 
 
-def _balanced_field_paths():
-    """Class-balanced field sampling — replaces class weights and repeat-count hacks."""
+def _make_train_map(iso_mix):
+    def _fn(raw, iso, label):
+        use_iso = tf.logical_and(
+            tf.strings.length(iso) > 0, tf.random.uniform([]) < iso_mix
+        )
+        img = tf.cond(
+            use_iso,
+            lambda: _prep_iso(_decode(iso), True),
+            lambda: _prep_raw(_decode(raw), True),
+        )
+        return img * 255.0, tf.one_hot(label, NUM_CLASSES)
+
+    return _fn
+
+
+def _make_eval_map(variant):
+    def _fn(raw, iso, label):
+        if variant == "iso":
+            img = tf.cond(
+                tf.strings.length(iso) > 0,
+                lambda: _prep_iso(_decode(iso), False),
+                lambda: _prep_raw(_decode(raw), False),
+            )
+        else:
+            img = _prep_raw(_decode(raw), False)
+        return img * 255.0, tf.one_hot(label, NUM_CLASSES)
+
+    return _fn
+
+
+def _balanced_field_ds(iso_mix):
     parts, weights = [], []
-    for idx, paths in sorted(field_by_class.items()):
-        parts.append(_paths_ds([(p, idx) for p in paths], shuffle=True))
-        w = len(paths) ** FIELD_BALANCE_TEMP
+    for idx, triples in sorted(field_by_class.items()):
+        parts.append(_triples_ds(triples, shuffle=True))
+        w = len(triples) ** FIELD_BALANCE_TEMP
         if class_names[idx] in HARD_FIELD_CLASSES:
             w *= HARD_CLASS_BOOST
         weights.append(w)
     w = np.array(weights, dtype=float)
-    return tf.data.Dataset.sample_from_datasets(parts, (w / w.sum()).tolist(), seed=SEED)
+    return tf.data.Dataset.sample_from_datasets(
+        parts, (w / w.sum()).tolist(), seed=SEED
+    )
 
 
 def _mixup(x, y):
     g1, g2 = tf.random.gamma([], MIXUP_ALPHA), tf.random.gamma([], MIXUP_ALPHA)
     lam = g1 / tf.maximum(g1 + g2, 1e-7)
     idx = tf.random.shuffle(tf.range(tf.shape(x)[0]))
-    return lam * x + (1 - lam) * tf.gather(x, idx), lam * y + (1 - lam) * tf.gather(y, idx)
+    return lam * x + (1 - lam) * tf.gather(x, idx), lam * y + (1 - lam) * tf.gather(
+        y, idx
+    )
 
 
-def train_dataset(field_mix, mixup, isolated=None):
+def train_dataset(field_mix, mixup, iso_mix, lab_pool=None, field_pool_ok=True):
+    lab_pool = lab_items if lab_pool is None else lab_pool
     parts, weights = [], []
-    if field_by_class:
-        parts.append(_balanced_field_paths())
+    if field_by_class and field_pool_ok and field_mix > 0:
+        parts.append(_balanced_field_ds(iso_mix))
         weights.append(field_mix)
-    if lab_items:
-        parts.append(_paths_ds(lab_items, shuffle=True))
-        weights.append(1.0 - field_mix)
+    if lab_pool:
+        parts.append(_triples_ds(lab_pool, shuffle=True))
+        weights.append(max(1e-6, 1.0 - field_mix) if parts else 1.0)
     if not parts:
-        raise RuntimeError('No training data found -- check dataset mounts and mappings.')
-    ds = parts[0] if len(parts) == 1 else tf.data.Dataset.sample_from_datasets(
-        parts, [w / sum(weights) for w in weights], seed=SEED)
-    ds = ds.repeat()
-    iso = isolated
-    ds = ds.map(lambda p, l: _load(p, l, True, iso), num_parallel_calls=AUTOTUNE)
-    ds = _ignore_errors(ds).batch(CLASSIFIER_BATCH, drop_remainder=True)
+        raise RuntimeError("No training data.")
+    ds = (
+        parts[0]
+        if len(parts) == 1
+        else tf.data.Dataset.sample_from_datasets(
+            parts, [w / sum(weights) for w in weights], seed=SEED
+        )
+    )
+    ds = ds.repeat().map(_make_train_map(iso_mix), num_parallel_calls=AUTOTUNE)
+    ds = ds.apply(tf.data.experimental.ignore_errors())
+    ds = ds.batch(BATCH, drop_remainder=True)
     if mixup and MIXUP_ALPHA > 0:
         ds = ds.map(_mixup, num_parallel_calls=AUTOTUNE)
     return ds.prefetch(AUTOTUNE)
 
 
-def eval_dataset(items, cache=False, isolated=None):
-    iso = isolated
-    ds = _paths_ds(items, shuffle=False).map(
-        lambda p, l: _load(p, l, False, iso), num_parallel_calls=AUTOTUNE)
-    ds = _ignore_errors(ds)
-    if cache:
+def eval_dataset(items, variant="raw", cache=False):
+    """No ignore_errors here — label order must stay aligned with `items`."""
+    ds = _triples_ds(items, shuffle=False).map(
+        _make_eval_map(variant), num_parallel_calls=AUTOTUNE
+    )
+    if cache and len(items) <= 1500:
         ds = ds.cache()
-    return ds.batch(CLASSIFIER_BATCH).prefetch(AUTOTUNE)
+    return ds.batch(BATCH).prefetch(AUTOTUNE)
 
 
-pd_val_ds = eval_dataset(val_items, cache=True)
-pd_test_ds = eval_dataset(test_items)
-pv_valid_ds = eval_dataset(pv_valid_items)
-pv_test_ds = eval_dataset(pv_test_items, cache=True) if pv_test_items else None
+def labels_of(items):
+    return np.array([c for _, _, c in items], dtype=np.int64)
 
 
-# ======================================================= 4. model + train ==
-def build_model(backbone_name=None, img_size=None):
-    backbone_name = backbone_name or _active_backbone
-    img_size = img_size or CLASSIFIER_IMG_SIZE
-    spec = BACKBONES[backbone_name]
-    base = spec['ctor'](include_top=False, weights='imagenet',
-                        input_shape=(img_size, img_size, 3))
+# ===================================================== 4. model ============
+@keras.utils.register_keras_serializable(package="tomato")
+class CaffePreprocess(keras.layers.Layer):
+    """RGB 0..255 -> BGR mean-subtracted (what Keras ResNet50 weights expect)."""
+
+    def call(self, x):
+        x = x[..., ::-1]
+        return x - tf.constant([103.939, 116.779, 123.68], dtype=x.dtype)
+
+
+BACKBONES = {
+    "efficientnetv2b0": dict(ctor=keras.applications.EfficientNetV2B0, prep=None),
+    "efficientnetv2s": dict(ctor=keras.applications.EfficientNetV2S, prep=None),
+    "efficientnetb0": dict(ctor=keras.applications.EfficientNetB0, prep=None),
+    "mobilenetv2": dict(ctor=keras.applications.MobileNetV2, prep="mnet"),
+    "resnet50": dict(ctor=keras.applications.ResNet50, prep="caffe"),
+}
+assert BACKBONE in BACKBONES
+
+
+def build_model(name=BACKBONE, img_size=IMG_SIZE):
+    spec = BACKBONES[name]
+    base = spec["ctor"](
+        include_top=False, weights="imagenet", input_shape=(img_size, img_size, 3)
+    )
     base.trainable = False
-    inputs = keras.Input((img_size, img_size, 3))
-    if backbone_name == 'resnet50':
-        x = keras.layers.Rescaling(1.0 / 255.0)(inputs)
-    elif spec['rescale']:
-        x = keras.layers.Rescaling(*spec['rescale'])(inputs)
+    inp = keras.Input((img_size, img_size, 3))  # always float32 0..255
+    if spec["prep"] == "caffe":
+        x = CaffePreprocess()(inp)
+    elif spec["prep"] == "mnet":
+        x = keras.layers.Rescaling(1 / 127.5, -1.0)(inp)
     else:
-        x = inputs
+        x = inp
     x = base(x, training=False)
     x = keras.layers.GlobalAveragePooling2D()(x)
     x = keras.layers.Dropout(DROPOUT)(x)
-    outputs = keras.layers.Dense(NUM_CLASSES, activation='softmax')(x)
-    return keras.Model(inputs, outputs, name=f'model_tomato_{backbone_name}'), base
+    out = keras.layers.Dense(NUM_CLASSES, activation="softmax", dtype="float32")(x)
+    return keras.Model(inp, out, name=f"tomato_{name}"), base
 
 
-def set_finetune(base, unfreeze_last=FINETUNE_LAST_N):
-    """Unfreeze the backbone but keep BatchNorm frozen — EfficientNet's stats break otherwise."""
+def set_finetune(base):
     base.trainable = True
-    cut = 0 if not unfreeze_last else max(0, len(base.layers) - unfreeze_last)
     n = 0
-    for i, layer in enumerate(base.layers):
-        layer.trainable = i >= cut and not isinstance(layer, keras.layers.BatchNormalization)
+    for layer in base.layers:
+        layer.trainable = not isinstance(layer, keras.layers.BatchNormalization)
         n += int(layer.trainable)
-    print(f'  fine-tune: {n}/{len(base.layers)} backbone layers trainable (BN frozen)')
+    print(f"  fine-tune: {n}/{len(base.layers)} layers trainable (BN frozen)")
 
 
 def build_metrics():
-    metrics = [keras.metrics.CategoricalAccuracy(name='acc')]
+    m = [keras.metrics.CategoricalAccuracy(name="acc")]
     try:
-        metrics.append(keras.metrics.F1Score(average='macro', name='macro_f1'))
+        m.append(keras.metrics.F1Score(average="macro", name="macro_f1"))
     except Exception:
         pass
-    return metrics
+    return m
+
+
+MONITOR = "val_macro_f1" if len(build_metrics()) > 1 else "val_acc"
 
 
 class Heartbeat(keras.callbacks.Callback):
-    """Kaggle shows nothing for minutes with verbose=2; print a pulse so it looks alive."""
-
     def __init__(self, every=100):
         super().__init__()
         self.every, self.t0 = every, time.time()
@@ -1277,349 +1309,480 @@ class Heartbeat(keras.callbacks.Callback):
     def on_train_batch_end(self, batch, logs=None):
         logs = logs or {}
         if (batch + 1) % self.every == 0:
-            print(f'    batch {batch + 1} loss={logs["loss"]:.4f} '
-                  f'acc={logs.get("acc", 0):.3f} ({time.time() - self.t0:.0f}s)', flush=True)
+            print(
+                f'    batch {batch + 1} loss={logs["loss"]:.4f} '
+                f'acc={logs.get("acc", 0):.3f} ({time.time() - self.t0:.0f}s)',
+                flush=True,
+            )
 
 
-MONITOR = 'val_macro_f1' if len(build_metrics()) > 1 else 'val_acc'
-
-
-def run_phase(model, base, cfg, train_ds=None, val_ds=None, save_path=None):
-    print(f"\n--- Phase {cfg['name']}: {cfg['epochs']}x{cfg['steps']} steps, "
-          f"lr={cfg['lr']}, field_mix={cfg['field_mix']:.0%}, mixup={cfg['mixup']} ---")
-    if cfg['finetune']:
+def run_phase(model, base, cfg, train_ds, val_ds, save_path):
+    print(
+        f"\n--- {cfg['name']}: {cfg['epochs']}x{cfg['steps']} lr={cfg['lr']} "
+        f"field={cfg['field_mix']:.0%} iso={cfg['iso_mix']:.0%} mixup={cfg['mixup']} ---"
+    )
+    if cfg["finetune"]:
         set_finetune(base)
-    schedule = keras.optimizers.schedules.CosineDecay(
-        cfg['lr'], decay_steps=cfg['epochs'] * cfg['steps'], alpha=0.03)
-    if PIPELINE_CLASSIFIER == 'resnet50' and PIPELINE_ENABLED:
-        optimizer = keras.optimizers.AdamW(
-            learning_rate=schedule, weight_decay=PAPER_WEIGHT_DECAY,
-            use_ema=USE_EMA, ema_momentum=0.999,
-            ema_overwrite_frequency=cfg['steps'] if USE_EMA else None)
-    else:
-        optimizer = keras.optimizers.Adam(
-            schedule, use_ema=USE_EMA, ema_momentum=0.999,
-            ema_overwrite_frequency=cfg['steps'] if USE_EMA else None)
-    model.compile(optimizer=optimizer,
-                  loss=keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
-                  metrics=build_metrics())
-    fit_kwargs = dict(
-        epochs=cfg['epochs'], steps_per_epoch=cfg['steps'], verbose=2,
+    sched = keras.optimizers.schedules.CosineDecay(
+        cfg["lr"], decay_steps=cfg["epochs"] * cfg["steps"], alpha=0.03
+    )
+    opt = keras.optimizers.AdamW(
+        learning_rate=sched,
+        weight_decay=WEIGHT_DECAY,
+        use_ema=USE_EMA,
+        ema_momentum=0.999,
+        ema_overwrite_frequency=cfg["steps"] if USE_EMA else None,
+    )
+    model.compile(
+        optimizer=opt,
+        loss=keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+        metrics=build_metrics(),
+    )
+    hist = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=cfg["epochs"],
+        steps_per_epoch=cfg["steps"],
+        verbose=2,
         callbacks=[
-            keras.callbacks.EarlyStopping(monitor=MONITOR, mode='max', patience=cfg['patience'],
-                                          restore_best_weights=True),
-            Heartbeat(max(50, cfg['steps'] // 8)),
-        ])
-    if train_ds is not None:
-        fit_kwargs['x'] = train_ds
-    else:
-        fit_kwargs['x'] = train_dataset(cfg['field_mix'], cfg['mixup'])
-    if val_ds is not None:
-        fit_kwargs['validation_data'] = val_ds
-    else:
-        fit_kwargs['validation_data'] = pd_val_ds
-    history = model.fit(**fit_kwargs)
-    model.save(save_path or MODEL_PATH)
-    return history.history
+            keras.callbacks.EarlyStopping(
+                monitor=MONITOR,
+                mode="max",
+                patience=cfg["patience"],
+                restore_best_weights=True,
+            ),
+            Heartbeat(max(50, cfg["steps"] // 8)),
+        ],
+    )
+    model.save(save_path)
+    return hist.history
 
 
-def run_paper_training(model, base, train_items=None, val_items_local=None, save_path=None):
-    """Paper Sec. III-E: ResNet-50, AdamW, cosine schedule, isolated-leaf inputs."""
-    train_items = train_items or lab_items
-    val_items_local = val_items_local or pv_valid_items
-    steps = max(1, len(train_items) // CLASSIFIER_BATCH)
-    cfg = dict(name='paper_resnet50', epochs=PAPER_EPOCHS, steps=steps, lr=PAPER_LR,
-               field_mix=0.0, mixup=False, finetune=True, patience=8)
-    train_ds = _paths_ds(train_items, shuffle=True).repeat()
-    train_ds = train_ds.map(lambda p, l: _load(p, l, True, True), num_parallel_calls=AUTOTUNE)
-    train_ds = _ignore_errors(train_ds).batch(CLASSIFIER_BATCH, drop_remainder=True).prefetch(AUTOTUNE)
-    val_ds = eval_dataset(val_items_local, cache=True, isolated=True)
-    return run_phase(model, base, cfg, train_ds=train_ds, val_ds=val_ds, save_path=save_path)
+# ===================================================== 5. train ============
+print("\n=== 3. Train ===")
+print(
+    f"backbone={BACKBONE} @ {IMG_SIZE}px | isolation={ISOLATION_MODE} "
+    f"| paper_protocol={PAPER_PROTOCOL} | monitor={MONITOR}"
+)
 
+if PAPER_PROTOCOL:
+    main_val_items = pv_valid_items
+else:
+    main_val_items = (
+        val_items if len(val_items) >= 40 else val_items + pv_valid_items[:200]
+    )
+    if len(val_items) < 40:
+        print(
+            "WARNING: tiny PlantDoc val — padding with PlantVillage val for stable early stop."
+        )
 
-def _swap_training_items(lab, field, val, pv_val):
-    global lab_items, field_items, val_items, pv_valid_items, field_by_class
-    lab_items, field_items, val_items, pv_valid_items = lab, field, val, pv_val
-    field_by_class = defaultdict(list)
-    for path, idx in field_items:
-        field_by_class[idx].append(path)
+iso_mix_main = (
+    1.0
+    if ISOLATION_MODE == "iso"
+    else (ISO_MIX_PROB if ISOLATION_MODE == "mix" else 0.0)
+)
+val_variant = "iso" if ISOLATION_MODE == "iso" else "raw"
+main_val_ds = eval_dataset(main_val_items, variant=val_variant, cache=True)
 
-
-print('\n=== 3. Train ===')
-print(f'Pipeline={PIPELINE_ENABLED} | classifier={_active_backbone} @ {CLASSIFIER_IMG_SIZE}px '
-      f'| paper_protocol={PAPER_PROTOCOL} | metric={MONITOR}')
 model, backbone = build_model()
 history = {}
-
-if PIPELINE_ENABLED and PIPELINE_CLASSIFIER == 'resnet50' and PAPER_PROTOCOL:
-    history['paper'] = run_paper_training(model, backbone, save_path=MODEL_PATH)
-else:
-    for cfg in PHASES:
-        history[cfg['name']] = run_phase(model, backbone, cfg)
-
-with open(f'{WORK}/training_history.json', 'w') as f:
-    json.dump(history, f, indent=2, default=float)
-print(f'\nSaved pipelined model -> {MODEL_PATH}')
-
-flat_model = None
-flat_history = {}
-if RUN_FLAT_BASELINE:
-    print('\n=== 3b. Flat baseline (no YOLO/SAM isolation) ===')
-    piped_lab, piped_field, piped_val, piped_pv_val = lab_items, field_items, val_items, pv_valid_items
+for cfg in PHASES:
+    cfg = dict(cfg, iso_mix=iso_mix_main)
     if PAPER_PROTOCOL:
-        flat_train, flat_val, _ = split_items_per_class(flat_lab_items, PAPER_SPLIT)
-        _swap_training_items(flat_train, [], [], flat_val)
-        flat_model, flat_backbone = build_model(backbone_name='resnet50', img_size=CLASSIFIER_IMG_SIZE)
-        flat_history['paper_flat'] = run_paper_training(
-            flat_model, flat_backbone, train_items=flat_train, val_items_local=flat_val,
-            save_path=FLAT_MODEL_PATH)
-    else:
-        _swap_training_items(flat_lab_items, flat_field_items, flat_val_items, flat_pv_valid_items)
-        flat_model, flat_backbone = build_model(
-            backbone_name='resnet50' if PIPELINE_CLASSIFIER == 'resnet50' else BACKBONE,
-            img_size=CLASSIFIER_IMG_SIZE if PIPELINE_CLASSIFIER == 'resnet50' else IMG_SIZE)
-        flat_val_ds = eval_dataset(val_items, cache=True, isolated=False)
-        for cfg in PHASES:
-            flat_history[cfg['name']] = run_phase(
-                flat_model, flat_backbone, cfg, val_ds=flat_val_ds, save_path=FLAT_MODEL_PATH)
-    flat_model.save(FLAT_MODEL_PATH)
-    _swap_training_items(piped_lab, piped_field, piped_val, piped_pv_val)
-    with open(f'{WORK}/training_history_flat.json', 'w') as f:
-        json.dump(flat_history, f, indent=2, default=float)
-    print(f'Saved flat baseline -> {FLAT_MODEL_PATH}')
+        cfg["field_mix"] = 0.0
+    ds = train_dataset(
+        cfg["field_mix"], cfg["mixup"], cfg["iso_mix"], field_pool_ok=not PAPER_PROTOCOL
+    )
+    history[cfg["name"]] = run_phase(model, backbone, cfg, ds, main_val_ds, MODEL_PATH)
+json.dump(history, open(f"{WORK}/training_history.json", "w"), indent=2, default=float)
+print(f"\nSaved -> {MODEL_PATH}")
+
+flat_model, flat_history = None, {}
+if RUN_FLAT_BASELINE:
+    print("\n=== 3b. Raw-only baseline (isolation channel disabled) ===")
+    flat_model, flat_base = build_model()
+    flat_val_ds = eval_dataset(main_val_items, variant="raw", cache=True)
+    for cfg in PHASES:
+        cfg = dict(cfg, iso_mix=0.0)
+        if PAPER_PROTOCOL:
+            cfg["field_mix"] = 0.0
+        ds = train_dataset(
+            cfg["field_mix"], cfg["mixup"], 0.0, field_pool_ok=not PAPER_PROTOCOL
+        )
+        flat_history[cfg["name"]] = run_phase(
+            flat_model, flat_base, cfg, ds, flat_val_ds, FLAT_MODEL_PATH
+        )
+    json.dump(
+        flat_history,
+        open(f"{WORK}/training_history_flat.json", "w"),
+        indent=2,
+        default=float,
+    )
 
 
-# ============================================================ 5. evaluate ==
-def predict_probs(m, ds, tta=USE_TTA):
-    size = CLASSIFIER_IMG_SIZE
-    views = [lambda x: x]
-    if tta:
-        views += [tf.image.flip_left_right, tf.image.flip_up_down,
-                  lambda x, _c=int(size * 0.85), _o=(size - int(size * 0.85)) // 2: tf.image.resize(
-                      tf.image.crop_to_bounding_box(x, _o, _o, _c, _c), (size, size)),
-                  lambda x, _c=int(size * 0.90), _o=(size - int(size * 0.90)) // 2: tf.image.resize(
-                      tf.image.crop_to_bounding_box(x, _o, _o, _c, _c), (size, size))]
-    total = None
-    for view in views:
-        p = m.predict(ds.map(lambda x, y, v=view: (v(x), y)), verbose=0)
-        total = p if total is None else total + p
-    return total / len(views)
+# ===================================================== 6. evaluate =========
+def _tta_views():
+    c85, o85 = int(IMG_SIZE * 0.85), (IMG_SIZE - int(IMG_SIZE * 0.85)) // 2
+    c92, o92 = int(IMG_SIZE * 0.92), (IMG_SIZE - int(IMG_SIZE * 0.92)) // 2
+    return [
+        lambda x: x,
+        tf.image.flip_left_right,
+        tf.image.flip_up_down,
+        lambda x: tf.image.rot90(x, 1),
+        lambda x: tf.image.resize(
+            tf.image.crop_to_bounding_box(x, o85, o85, c85, c85), (IMG_SIZE, IMG_SIZE)
+        ),
+        lambda x: tf.image.resize(
+            tf.image.crop_to_bounding_box(x, o92, o92, c92, c92), (IMG_SIZE, IMG_SIZE)
+        ),
+    ]
 
 
-def true_labels(ds):
-    parts = [np.argmax(y.numpy(), axis=1) for _, y in ds]
-    return np.concatenate(parts) if parts else np.array([], dtype=np.int64)
+def predict_probs(m, items, variants=("raw",), tta=False):
+    views = _tta_views() if tta else [lambda x: x]
+    total, n = None, 0
+    for v in variants:
+        if v == "iso" and not any(b for _, b, _ in items):
+            continue
+        ds = eval_dataset(items, variant=v)
+        for view in views:
+            p = m.predict(ds.map(lambda x, y, f=view: (f(x), y)), verbose=0)
+            total = p if total is None else total + p
+            n += 1
+    return total / max(n, 1)
 
 
-def eval_scores(m, ds):
-    y_true_local = true_labels(ds)
-    if len(y_true_local) == 0:
-        return dict(acc=0.0, macro_f1=0.0, weighted_f1=0.0, y_true=y_true_local, y_hat=np.array([]))
-    probs = predict_probs(m, ds, tta=False)
-    y_hat = probs.argmax(1)
-    acc = float((y_hat == y_true_local).mean())
-    labels = supported_idx if set(y_true_local).issubset(set(supported_idx)) else list(range(NUM_CLASSES))
-    _, _, f1_sup, _ = precision_recall_fscore_support(
-        y_true_local, y_hat, labels=labels, average='macro', zero_division=0)
-    _, _, f1_w, _ = precision_recall_fscore_support(
-        y_true_local, y_hat, labels=labels, average='weighted', zero_division=0)
-    return dict(acc=acc, macro_f1=float(f1_sup), weighted_f1=float(f1_w),
-                y_true=y_true_local, y_hat=y_hat)
-
-
-def domain_gap(in_acc, ood_acc):
-    abs_drop = (in_acc - ood_acc) * 100
-    rel_drop = (abs_drop / max(in_acc * 100, 1e-6)) * 100
-    return abs_drop, rel_drop
-
-
-print('\n=== 4. Evaluate ===')
-pd_test_ds = eval_dataset(test_items, isolated=True)
-flat_pd_test_ds = eval_dataset(flat_test_items, isolated=False)
-pv_eval_items = pv_test_items if pv_test_items else flat_pv_valid_items
-pv_eval_ds = eval_dataset(pv_eval_items, cache=True, isolated=PIPELINE_ENABLED)
-flat_pv_eval_ds = eval_dataset(flat_pv_valid_items, cache=True, isolated=False)
-
-pipe_pv = eval_scores(model, pv_eval_ds)
-pipe_pd = eval_scores(model, pd_test_ds)
-pipe_pv_tta_ds = eval_dataset(pv_eval_items, cache=True, isolated=PIPELINE_ENABLED)
-pipe_pd_tta = eval_scores(model, pd_test_ds)  # TTA handled separately below
-
-y_true = pipe_pd['y_true']
-probs_plain = predict_probs(model, pd_test_ds, tta=False)
-probs_tta = predict_probs(model, pd_test_ds, tta=True) if USE_TTA else probs_plain
-y_plain, y_tta = probs_plain.argmax(1), probs_tta.argmax(1)
-pv_probs = predict_probs(model, pv_eval_ds, tta=False)
-pv_acc = float((pv_probs.argmax(1) == true_labels(pv_eval_ds)).mean())
-
-
-def scores(y_hat):
-    if len(y_true) == 0 or not supported_idx:
+def score(y_true, y_hat, labels=None):
+    if len(y_true) == 0:
         return 0.0, 0.0, 0.0
+    labels = labels or sorted(set(y_true.tolist()))
     acc = float((y_hat == y_true).mean())
-    _, _, f1_sup, _ = precision_recall_fscore_support(y_true, y_hat, labels=supported_idx,
-                                                      average='macro', zero_division=0)
-    _, _, f1_w, _ = precision_recall_fscore_support(y_true, y_hat, labels=supported_idx,
-                                                    average='weighted', zero_division=0)
-    return acc, float(f1_sup), float(f1_w)
+    _, _, f1m, _ = precision_recall_fscore_support(
+        y_true, y_hat, labels=labels, average="macro", zero_division=0
+    )
+    _, _, f1w, _ = precision_recall_fscore_support(
+        y_true, y_hat, labels=labels, average="weighted", zero_division=0
+    )
+    return acc, float(f1m), float(f1w)
 
 
-acc_plain, f1_plain, f1w_plain = scores(y_plain)
-acc_tta, f1_tta, f1w_tta = scores(y_tta)
+print("\n=== 4. Evaluate ===")
+pv_eval_items = pv_test_items if pv_test_items else pv_valid_items
+y_pv = labels_of(pv_eval_items)
+y_pd = labels_of(test_items)
 
-print(f'Pipelined — PlantVillage in-domain : {pipe_pv["acc"] * 100:.1f}% acc | macro-F1 {pipe_pv["macro_f1"]:.3f}')
-print(f'Pipelined — PlantDoc real-world    : {acc_plain * 100:.1f}% acc | macro-F1 {f1_plain:.3f}')
-print(f'Pipelined — PlantDoc + TTA         : {acc_tta * 100:.1f}% acc | macro-F1 {f1_tta:.3f}')
+eval_variants = ["raw"]
+if ISOLATION_MODE == "iso":
+    eval_variants = ["iso"]
+elif ISOLATION_MODE == "mix" and FUSE_ISO_AT_EVAL:
+    eval_variants = ["raw", "iso"]
+
+pv_probs = predict_probs(model, pv_eval_items, variants=eval_variants[:1], tta=False)
+pv_acc, pv_f1, _ = score(y_pv, pv_probs.argmax(1))
+
+pd_probs_raw = predict_probs(model, test_items, variants=eval_variants[:1], tta=False)
+acc_plain, f1_plain, f1w_plain = score(y_pd, pd_probs_raw.argmax(1), supported_idx)
+
+pd_probs_tta = (
+    predict_probs(model, test_items, variants=eval_variants, tta=USE_TTA)
+    if USE_TTA or len(eval_variants) > 1
+    else pd_probs_raw
+)
+acc_tta, f1_tta, f1w_tta = score(y_pd, pd_probs_tta.argmax(1), supported_idx)
+
+print(f"PlantVillage (in-domain) : {pv_acc * 100:.1f}% acc | macro-F1 {pv_f1:.3f}")
+print(
+    f"PlantDoc (field, plain)  : {acc_plain * 100:.1f}% acc | macro-F1 {f1_plain:.3f}"
+)
+print(
+    f'PlantDoc (+TTA{"+iso-fuse" if len(eval_variants) > 1 else ""}) : '
+    f"{acc_tta * 100:.1f}% acc | macro-F1 {f1_tta:.3f}"
+)
 
 generalization = {}
 if flat_model is not None:
-    flat_pv = eval_scores(flat_model, flat_pv_eval_ds)
-    flat_pd = eval_scores(flat_model, flat_pd_test_ds)
-    pipe_gap = domain_gap(pipe_pv['acc'], acc_plain)
-    flat_gap = domain_gap(flat_pv['acc'], flat_pd['acc'])
-    print('\n--- Paper-style generalization comparison (Table 5) ---')
-    print(f'Flat ResNet      PV {flat_pv["acc"]*100:.1f}% -> PlantDoc {flat_pd["acc"]*100:.1f}% '
-          f'(drop {flat_gap[0]:.1f} pp, {flat_gap[1]:.1f}% relative)')
-    print(f'Pipelined ResNet PV {pipe_pv["acc"]*100:.1f}% -> PlantDoc {acc_plain*100:.1f}% '
-          f'(drop {pipe_gap[0]:.1f} pp, {pipe_gap[1]:.1f}% relative)')
+    f_pv = predict_probs(flat_model, pv_eval_items, ("raw",), tta=False).argmax(1)
+    f_pd = predict_probs(flat_model, test_items, ("raw",), tta=False).argmax(1)
+    fa_pv, ff_pv, _ = score(y_pv, f_pv)
+    fa_pd, ff_pd, _ = score(y_pd, f_pd, supported_idx)
+    print("\n--- Ablation: isolation channel on/off ---")
+    print(
+        f"raw-only : PV {fa_pv*100:.1f}% -> PD {fa_pd*100:.1f}% "
+        f"(drop {(fa_pv-fa_pd)*100:.1f} pp)"
+    )
+    print(
+        f"iso-mix  : PV {pv_acc*100:.1f}% -> PD {acc_plain*100:.1f}% "
+        f"(drop {(pv_acc-acc_plain)*100:.1f} pp)"
+    )
     generalization = {
-        'pipelined': {
-            'plantvillage': pipe_pv, 'plantdoc': {'acc': acc_plain, 'macro_f1': f1_plain, 'weighted_f1': f1w_plain},
-            'accuracy_drop_pp': pipe_gap[0], 'accuracy_drop_pct': pipe_gap[1],
+        "raw_only": {
+            "pv_acc": fa_pv,
+            "pv_macro_f1": ff_pv,
+            "pd_acc": fa_pd,
+            "pd_macro_f1": ff_pd,
         },
-        'flat': {
-            'plantvillage': flat_pv, 'plantdoc': flat_pd,
-            'accuracy_drop_pp': flat_gap[0], 'accuracy_drop_pct': flat_gap[1],
+        "iso_mix": {
+            "pv_acc": pv_acc,
+            "pv_macro_f1": pv_f1,
+            "pd_acc": acc_plain,
+            "pd_macro_f1": f1_plain,
         },
     }
-    pd.DataFrame([
-        {'model': 'pipelined', 'dataset': 'PlantVillage', 'acc': pipe_pv['acc'], 'macro_f1': pipe_pv['macro_f1']},
-        {'model': 'pipelined', 'dataset': 'PlantDoc', 'acc': acc_plain, 'macro_f1': f1_plain},
-        {'model': 'flat', 'dataset': 'PlantVillage', 'acc': flat_pv['acc'], 'macro_f1': flat_pv['macro_f1']},
-        {'model': 'flat', 'dataset': 'PlantDoc', 'acc': flat_pd['acc'], 'macro_f1': flat_pd['macro_f1']},
-    ]).to_csv(f'{WORK}/generalization_comparison.csv', index=False)
+    pd.DataFrame(
+        [
+            {
+                "model": "raw_only",
+                "dataset": "PlantVillage",
+                "acc": fa_pv,
+                "macro_f1": ff_pv,
+            },
+            {
+                "model": "raw_only",
+                "dataset": "PlantDoc",
+                "acc": fa_pd,
+                "macro_f1": ff_pd,
+            },
+            {
+                "model": "iso_mix",
+                "dataset": "PlantVillage",
+                "acc": pv_acc,
+                "macro_f1": pv_f1,
+            },
+            {
+                "model": "iso_mix",
+                "dataset": "PlantDoc",
+                "acc": acc_plain,
+                "macro_f1": f1_plain,
+            },
+        ]
+    ).to_csv(f"{WORK}/generalization_comparison.csv", index=False)
 
-if PIPELINE_ENABLED:
-    save_lime_explanations(model, test_items[:LIME_SAMPLES] if test_items else [], 'pipelined_plantdoc')
-    save_lime_explanations(model, pv_eval_items[:LIME_SAMPLES] if pv_eval_items else [], 'pipelined_pv')
-    if flat_model is not None:
-        save_lime_explanations(flat_model, flat_test_items[:LIME_SAMPLES], 'flat_plantdoc')
-
-conf = probs_plain.max(1)
-gate = pd.DataFrame([
-    {'min_confidence': t,
-     'coverage': float((conf >= t).mean()),
-     'accuracy_when_answering': float((y_plain[conf >= t] == y_true[conf >= t]).mean())
-     if (conf >= t).any() else 0.0}
-    for t in (0.0, 0.3, 0.5, 0.7, 0.9)])
-print('\nConfidence gating (deploy model, no TTA):')
+conf = pd_probs_raw.max(1)
+y_hat = pd_probs_raw.argmax(1)
+gate = pd.DataFrame(
+    [
+        {
+            "min_confidence": t,
+            "coverage": float((conf >= t).mean()),
+            "accuracy_when_answering": (
+                float((y_hat[conf >= t] == y_pd[conf >= t]).mean())
+                if (conf >= t).any()
+                else 0.0
+            ),
+        }
+        for t in (0.0, 0.3, 0.5, 0.7, 0.9)
+    ]
+)
+print("\nConfidence gating (no TTA):")
 print(gate.to_string(index=False))
-gate.to_csv(f'{WORK}/confidence_gating.csv', index=False)
+gate.to_csv(f"{WORK}/confidence_gating.csv", index=False)
 
-_, _, per_class_f1, _ = precision_recall_fscore_support(
-    y_true, y_tta, labels=list(range(NUM_CLASSES)), zero_division=0)
-per_class = pd.DataFrame({
-    'Class': class_names,
-    'PlantDoc support': [test_support[i] for i in range(NUM_CLASSES)],
-    'Field images': [len(field_by_class.get(i, [])) for i in range(NUM_CLASSES)],
-    'F1': np.round(per_class_f1, 3),
-})
-per_class.to_csv(f'{WORK}/per_class_metrics.csv', index=False)
-measurable = per_class[per_class['PlantDoc support'] > 0].sort_values('F1', ascending=False)
-print('\nBest 5:\n' + measurable.head(5).to_string(index=False))
-print('\nWorst 5 (add field images for these first):\n' + measurable.tail(5).to_string(index=False))
+_, _, per_f1, _ = precision_recall_fscore_support(
+    y_pd, pd_probs_tta.argmax(1), labels=list(range(NUM_CLASSES)), zero_division=0
+)
+per_class = pd.DataFrame(
+    {
+        "Class": class_names,
+        "PlantDoc support": [test_support[i] for i in range(NUM_CLASSES)],
+        "Field images": [len(field_by_class.get(i, [])) for i in range(NUM_CLASSES)],
+        "F1": np.round(per_f1, 3),
+    }
+)
+per_class.to_csv(f"{WORK}/per_class_metrics.csv", index=False)
+measurable = per_class[per_class["PlantDoc support"] > 0].sort_values(
+    "F1", ascending=False
+)
+print("\nBest 5:\n" + measurable.head(5).to_string(index=False))
+print("\nWorst 5:\n" + measurable.tail(5).to_string(index=False))
 
-with open(f'{WORK}/evaluation_report.json', 'w') as f:
-    json.dump({
-        'model': 'tomato-hierarchical' if PIPELINE_ENABLED else 'tomato-only',
-        'pipeline_enabled': PIPELINE_ENABLED,
-        'paper_protocol': PAPER_PROTOCOL,
-        'pipeline_stages': ['yolo11', SEGMENTATION_BACKEND, PIPELINE_CLASSIFIER, 'lime'],
-        'backbone': _active_backbone,
-        'img_size': CLASSIFIER_IMG_SIZE,
-        'num_classes': NUM_CLASSES,
-        'scorable_classes': len(supported_idx),
-        'pv_valid_acc': pv_acc,
-        'plantdoc': {'acc': acc_plain, 'macro_f1_supported': f1_plain, 'weighted_f1': f1w_plain},
-        'plantdoc_tta': {'acc': acc_tta, 'macro_f1_supported': f1_tta, 'weighted_f1': f1w_tta},
-        'train_images': {'lab': len(flat_lab_items), 'field': len(flat_field_items)},
-        'per_class': per_class.to_dict('records'),
-        'generalization': generalization,
-        'pipeline_stats': dict(_pipeline_stats),
-    }, f, indent=2, default=float)
+json.dump(
+    {
+        "backbone": BACKBONE,
+        "img_size": IMG_SIZE,
+        "isolation_mode": ISOLATION_MODE,
+        "iso_mix_prob": iso_mix_main,
+        "bg_randomize_prob": BG_RANDOMIZE_PROB,
+        "paper_protocol": PAPER_PROTOCOL,
+        "eval_variants": eval_variants,
+        "scorable_classes": len(supported_idx),
+        "plantvillage": {"acc": pv_acc, "macro_f1": pv_f1},
+        "plantdoc": {"acc": acc_plain, "macro_f1": f1_plain, "weighted_f1": f1w_plain},
+        "plantdoc_tta": {"acc": acc_tta, "macro_f1": f1_tta, "weighted_f1": f1w_tta},
+        "train_images": {"lab": len(lab_items), "field": len(field_items)},
+        "iso_available": {
+            "lab": sum(1 for _, b, _ in lab_items if b),
+            "field": sum(1 for _, b, _ in field_items if b),
+            "pd_test": sum(1 for _, b, _ in test_items if b),
+        },
+        "per_class": per_class.to_dict("records"),
+        "generalization": generalization,
+    },
+    open(f"{WORK}/evaluation_report.json", "w"),
+    indent=2,
+    default=float,
+)
 
-# ------------------------------------------------------------------ plots ---
+
+# ------------------------------------------------------------- LIME -------
+def save_lime(m, items, tag, n=LIME_SAMPLES):
+    try:
+        from lime import lime_image
+        from skimage.segmentation import mark_boundaries
+    except ImportError:
+        print("  LIME unavailable — skipping")
+        return
+    if not items:
+        return
+    out_dir = f"{WORK}/lime_{tag}"
+    os.makedirs(out_dir, exist_ok=True)
+    explainer = lime_image.LimeImageExplainer()
+    rng = np.random.default_rng(SEED)
+    picks = (
+        items
+        if len(items) <= n
+        else [items[i] for i in rng.choice(len(items), n, replace=False)]
+    )
+    for i, (raw, iso, label) in enumerate(picks):
+        try:
+            src = iso if (iso and ISOLATION_MODE == "iso") else raw
+            im = Image.open(src).convert("RGB")
+            s = min(im.size)
+            l, t = (im.width - s) // 2, (im.height - s) // 2
+            arr = np.asarray(
+                im.crop((l, t, l + s, t + s)).resize((IMG_SIZE, IMG_SIZE)),
+                dtype=np.float64,
+            )  # 0..255, model-native
+            exp = explainer.explain_instance(
+                arr,
+                lambda z: m.predict(z.astype("float32"), verbose=0),
+                top_labels=1,
+                hide_color=0,
+                num_samples=800,
+            )
+            top = exp.top_labels[0]
+            temp, mask = exp.get_image_and_mask(
+                top, positive_only=True, num_features=LIME_NUM_FEATURES, hide_rest=True
+            )
+            fig, ax = plt.subplots(1, 2, figsize=(8, 4))
+            ax[0].imshow(arr.astype(np.uint8))
+            ax[0].set_title(f"True: {class_names[label]}")
+            ax[1].imshow(mark_boundaries(temp / 255.0, mask))
+            ax[1].set_title(f"LIME -> {class_names[top]}")
+            for a in ax:
+                a.axis("off")
+            fig.tight_layout()
+            fig.savefig(f"{out_dir}/sample_{i + 1}.png", dpi=150)
+            plt.close(fig)
+        except Exception as exc:
+            print(f"  LIME {i + 1} failed: {exc}")
+    print(f"  LIME -> {out_dir}/")
+
+
+save_lime(model, test_items, "plantdoc")
+save_lime(model, pv_eval_items, "plantvillage")
+
+
+# ------------------------------------------------------------ plots -------
 plt.figure(figsize=(10, 8))
-sns.heatmap(confusion_matrix(y_true, y_tta, labels=range(NUM_CLASSES)), cmap='Blues', cbar=False,
-            xticklabels=class_names, yticklabels=class_names)
+sns.heatmap(
+    confusion_matrix(y_pd, pd_probs_tta.argmax(1), labels=range(NUM_CLASSES)),
+    cmap="Blues",
+    cbar=False,
+    xticklabels=class_names,
+    yticklabels=class_names,
+)
 plt.tick_params(labelsize=6)
-plt.title('PlantDoc tomato confusion matrix')
+plt.title("PlantDoc tomato confusion matrix")
 plt.tight_layout()
-plt.savefig(f'{WORK}/confusion_matrix.png', dpi=200)
+plt.savefig(f"{WORK}/confusion_matrix.png", dpi=200)
 plt.close()
 
 plt.figure(figsize=(8, 6))
-plt.barh(np.arange(len(measurable)), measurable['F1'], color='#4C72B0')
-plt.yticks(np.arange(len(measurable)), measurable['Class'], fontsize=8)
+plt.barh(np.arange(len(measurable)), measurable["F1"], color="#4C72B0")
+plt.yticks(np.arange(len(measurable)), measurable["Class"], fontsize=8)
 plt.gca().invert_yaxis()
-plt.xlabel('F1')
+plt.xlabel("F1")
 plt.tight_layout()
-plt.savefig(f'{WORK}/per_class_f1.png', dpi=200)
+plt.savefig(f"{WORK}/per_class_f1.png", dpi=200)
 plt.close()
 
 plt.figure(figsize=(6, 5))
-bars = plt.bar(['PlantVillage (lab)', 'PlantDoc (field)'], [pv_acc * 100, acc_plain * 100],
-               0.5, color='#4C72B0')
+bars = plt.bar(
+    ["PlantVillage (lab)", "PlantDoc (field)"],
+    [pv_acc * 100, acc_plain * 100],
+    0.5,
+    color="#4C72B0",
+)
 for b in bars:
-    plt.text(b.get_x() + b.get_width() / 2, b.get_height() + 1, f'{b.get_height():.1f}%',
-             ha='center')
+    plt.text(
+        b.get_x() + b.get_width() / 2,
+        b.get_height() + 1,
+        f"{b.get_height():.1f}%",
+        ha="center",
+    )
 plt.ylim(0, 105)
-plt.ylabel('Accuracy %')
-plt.title('Domain gap — tomato model (deploy, no TTA)')
+plt.ylabel("Accuracy %")
+plt.title("Domain gap")
 plt.tight_layout()
-plt.savefig(f'{WORK}/domain_gap.png', dpi=200)
+plt.savefig(f"{WORK}/domain_gap.png", dpi=200)
 plt.close()
 
 
-# ====================================================== 6. package output ==
-print('\n=== 5. Package artifacts ===')
-KEEP = {'model_tomato.keras', 'model_tomato_flat.keras', 'class_names.json', 'evaluation_report.json',
-        'per_class_metrics.csv', 'class_coverage.csv', 'confidence_gating.csv',
-        'training_history.json', 'training_history_flat.json', 'pipeline_stats.json',
-        'generalization_comparison.csv', 'confusion_matrix.png', 'per_class_f1.png', 'domain_gap.png'}
-KEEP_PREFIX = ('mapping_', 'lime_')
-
-for name in ('plantdoc', 'data', 'tomato'):
+# ===================================================== 7. package ==========
+print("\n=== 5. Package ===")
+for name in ("plantdoc", "data", "tomato"):
     shutil.rmtree(os.path.join(WORK, name), ignore_errors=True)
 
-ART_ZIP = f'{WORK}/dsn_tomato_artifacts.zip'
-with zipfile.ZipFile(ART_ZIP, 'w', zipfile.ZIP_DEFLATED) as zf:
+KEEP = {
+    "model_tomato.keras",
+    "model_tomato_flat.keras",
+    "class_names.json",
+    "evaluation_report.json",
+    "per_class_metrics.csv",
+    "class_coverage.csv",
+    "confidence_gating.csv",
+    "training_history.json",
+    "training_history_flat.json",
+    "generalization_comparison.csv",
+    "confusion_matrix.png",
+    "per_class_f1.png",
+    "domain_gap.png",
+    "pipeline_stats.json",
+}
+ART = f"{WORK}/dsn_tomato_artifacts.zip"
+with zipfile.ZipFile(ART, "w", zipfile.ZIP_DEFLATED) as zf:
     for entry in sorted(os.listdir(WORK)):
-        if entry in KEEP or entry.startswith(KEEP_PREFIX):
-            path = os.path.join(WORK, entry)
-            if os.path.isfile(path):
-                zf.write(path, entry,
-                         zipfile.ZIP_STORED if entry.endswith('.keras') else zipfile.ZIP_DEFLATED)
-print(f'dsn_tomato_artifacts.zip ({os.path.getsize(ART_ZIP) / 1e6:.1f} MB)')
-disk_free('end')
+        p = os.path.join(WORK, entry)
+        if os.path.isfile(p) and (
+            entry in KEEP or entry.startswith(("mapping_", "lime_"))
+        ):
+            zf.write(
+                p,
+                entry,
+                (
+                    zipfile.ZIP_STORED
+                    if entry.endswith(".keras")
+                    else zipfile.ZIP_DEFLATED
+                ),
+            )
+print(f"{os.path.basename(ART)} ({os.path.getsize(ART) / 1e6:.1f} MB)")
+disk_free("end")
 
-print("""
---- Serving (hierarchical pipeline) ---
-# 1) YOLO11 detect leaf ROI  2) SAM/GrabCut isolate leaf  3) classifier  4) optional LIME
-from PIL import Image; import numpy as np, tensorflow as tf, json
-model = tf.keras.models.load_model('model_tomato.keras')
+print(f"""
+--- Serving ---
+import json, numpy as np, tensorflow as tf
+from PIL import Image
+model = tf.keras.models.load_model('model_tomato.keras')      # 0..255 float input
 classes = json.load(open('class_names.json'))
 
-def serve_image(path, size=%d):
-    img = Image.open(path).convert('RGB')
-    # apply isolate_leaf_image() from training script at inference
-    s = min(img.size)
-    l, t = (img.width - s) // 2, (img.height - s) // 2
-    img = img.crop((l, t, l + s, t + s)).resize((size, size), Image.BILINEAR)
-    arr = np.asarray(img, dtype='float32')
-    return arr[None] / 255.0 if '%s' == 'resnet50' else arr[None]
+def serve(path, size={IMG_SIZE}):
+    im = Image.open(path).convert('RGB')
+    s = min(im.size); l, t = (im.width - s)//2, (im.height - s)//2
+    im = im.crop((l, t, l+s, t+s)).resize((size, size), Image.BILINEAR)
+    return np.asarray(im, dtype='float32')[None]
 
-p = model.predict(serve_image('leaf.jpg'))[0]
-label, confidence = classes[p.argmax()], float(p.max())
-# reject below the threshold picked from confidence_gating.csv
-""" % (CLASSIFIER_IMG_SIZE, PIPELINE_CLASSIFIER))
+p = model.predict(serve('leaf.jpg'))[0]
+label, conf = classes[int(p.argmax())], float(p.max())
+# Reject below the threshold you pick from confidence_gating.csv.
+# No YOLO/SAM needed at inference: the model was trained to handle raw photos.
+""")
