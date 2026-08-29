@@ -36,8 +36,8 @@ PIPELINE_IMG_SIZE = 64 if PIPELINE_CLASSIFIER == 'resnet50' else IMG_SIZE
 PIPELINE_CACHE_DIR = f'{WORK}/pipeline_cache'
 PIPELINE_REBUILD_CACHE = False
 PIPELINE_CACHE_ZIP = f'{WORK}/pipeline_cache.zip'          # saved to output after caching
-PIPELINE_CACHE_DATASET = 'pipeline-cache'                  # Kaggle dataset slug to restore from (mount as Input)
-BUILD_CACHE_ONLY = True            # True: build cache + zip + exit (no training). False: restore cache from Input + train
+PIPELINE_CACHE_INPUT_PATH = '/kaggle/input/datasets/jitishxd/<what-ever-name>' # Explicit path to the extracted cache dataset
+BUILD_CACHE_ONLY = True             # True: build cache + zip + exit (no training). False: restore cache from Input + train
 
 # Stage 1 — YOLO11 leaf detection (paper: Roboflow leaf dataset, yolo11n @ 640px)
 YOLO_WEIGHTS = 'yolo11n.pt'
@@ -285,22 +285,18 @@ def file_md5(path):
     return h.hexdigest()
 
 
-def _fast_cache_key(path):
-    """Fast cache key from path + stat (no file read). Replaces file_md5 for cache paths."""
-    st = os.stat(path)
-    token = f'{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}'
-    return hashlib.md5(token.encode()).hexdigest()
-
-
 # ========================================= hierarchical pipeline (paper) ===
 _yolo_model = None
 _pipeline_stats = defaultdict(int)
 
-
 def _pipeline_cache_path(src_path, tag=''):
-    key = _fast_cache_key(src_path)
+    """Generate cache path using original folder and filename (e.g., Tomato___Blight/img.jpg)."""
+    parts = os.path.normpath(src_path).split(os.sep)
+    rel_path = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else parts[-1]
+    # Ensure it ends in .jpg since we save it as a JPEG
+    rel_path = os.path.splitext(rel_path)[0] + '.jpg'
     sub = tag or 'shared'
-    return os.path.join(PIPELINE_CACHE_DIR, sub, f'{key}.jpg')
+    return os.path.join(PIPELINE_CACHE_DIR, sub, rel_path)
 
 
 def _center_square_pil(pil_img):
@@ -537,6 +533,7 @@ def cache_pipeline_items(items, tag):
         if not PIPELINE_REBUILD_CACHE and os.path.isfile(dst):
             skipped += 1
         else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
             try:
                 isolate_leaf_image(Image.open(src).convert('RGB')).save(dst, quality=92)
             except Exception:
@@ -554,48 +551,19 @@ def cache_pipeline_items(items, tag):
 
 
 def restore_pipeline_cache():
-    """Restore pipeline cache from a mounted Kaggle input dataset (runs before caching).
-
-    Mount your saved cache dataset as a Kaggle Input. This function finds the
-    pipeline_cache.zip inside /kaggle/input/<slug>/ and extracts it so that
-    cache_pipeline_items() will skip all already-processed images.
-    """
+    """Restore pipeline cache from a mounted Kaggle input dataset (runs before caching)."""
     if not PIPELINE_ENABLED:
         return False
-    # Already populated from a previous cell/run in this session?
     if os.path.isdir(PIPELINE_CACHE_DIR) and len(os.listdir(PIPELINE_CACHE_DIR)) > 0:
-        n = sum(len(files) for _, _, files in os.walk(PIPELINE_CACHE_DIR))
-        print(f'  Pipeline cache already present ({n} files) — skipping restore')
         return True
-    # Search /kaggle/input for the cache zip
-    cache_zip = None
-    base = '/kaggle/input'
-    if os.path.isdir(base):
-        for root, dirs, files in os.walk(base):
-            dirs.sort()
-            for fname in files:
-                if fname == 'pipeline_cache.zip':
-                    cache_zip = os.path.join(root, fname)
-                    break
-            if cache_zip:
-                break
-            # Also search by dataset slug hint
-            for d in dirs:
-                if PIPELINE_CACHE_DATASET in d.lower():
-                    slug_dir = os.path.join(root, d)
-                    candidate = os.path.join(slug_dir, 'pipeline_cache.zip')
-                    if os.path.isfile(candidate):
-                        cache_zip = candidate
-                        break
-            if cache_zip:
-                break
-    if not cache_zip:
-        print('  No pipeline cache dataset found in /kaggle/input — will build from scratch')
+
+    if not PIPELINE_CACHE_INPUT_PATH or not os.path.isdir(PIPELINE_CACHE_INPUT_PATH):
+        print(f'  No extracted pipeline cache found at {PIPELINE_CACHE_INPUT_PATH} — will build from scratch')
         return False
-    print(f'  Restoring pipeline cache from {cache_zip}...')
+
+    print(f'  Restoring extracted pipeline cache directly from {PIPELINE_CACHE_INPUT_PATH}...')
     t0 = time.time()
-    with zipfile.ZipFile(cache_zip, 'r') as zf:
-        zf.extractall(PIPELINE_CACHE_DIR)
+    shutil.copytree(PIPELINE_CACHE_INPUT_PATH, PIPELINE_CACHE_DIR, dirs_exist_ok=True)
     n = sum(len(files) for _, _, files in os.walk(PIPELINE_CACHE_DIR))
     print(f'  Restored {n} cached images in {time.time() - t0:.1f}s')
     return True
