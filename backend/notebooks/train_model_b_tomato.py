@@ -36,8 +36,8 @@ PIPELINE_IMG_SIZE = 64 if PIPELINE_CLASSIFIER == 'resnet50' else IMG_SIZE
 PIPELINE_CACHE_DIR = f'{WORK}/pipeline_cache'
 PIPELINE_REBUILD_CACHE = False
 PIPELINE_CACHE_ZIP = f'{WORK}/pipeline_cache.zip'          # saved to output after caching
-PIPELINE_CACHE_INPUT_PATH = '/kaggle/input/datasets/jitishxd/<what-ever-name>' # Explicit path to the extracted cache dataset
-BUILD_CACHE_ONLY = True             # True: build cache + zip + exit (no training). False: restore cache from Input + train
+PIPELINE_CACHE_INPUT_PATH = '/kaggle/input/datasets/jitishxd/dangerous-tamatar' # Explicit path to the extracted cache dataset
+BUILD_CACHE_ONLY = False             # True: build cache + zip + exit (no training). False: restore cache from Input + train
 
 # Stage 1 — YOLO11 leaf detection (paper: Roboflow leaf dataset, yolo11n @ 640px)
 YOLO_WEIGHTS = 'yolo11n.pt'
@@ -293,6 +293,12 @@ def _pipeline_cache_path(src_path, tag=''):
     """Generate cache path using original folder and filename (e.g., Tomato___Blight/img.jpg)."""
     parts = os.path.normpath(src_path).split(os.sep)
     rel_path = f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else parts[-1]
+    
+    # Sanitize forbidden characters for Kaggle dataset upload compatibility
+    import re
+    rel_path = re.sub(r'[?&]', '_', rel_path)
+    rel_path = re.sub(r'\s+\.', '.', rel_path)
+    
     # Ensure it ends in .jpg since we save it as a JPEG
     rel_path = os.path.splitext(rel_path)[0] + '.jpg'
     sub = tag or 'shared'
@@ -1005,7 +1011,7 @@ if PIPELINE_ENABLED:
         print('CACHE BUILD COMPLETE — no training in this mode.')
         print('Next steps:')
         print('  1. Save this notebook\'s Output as a Kaggle Dataset')
-        print(f'     (suggested slug: "<your-username>/{PIPELINE_CACHE_DATASET}")')
+        print(f'     (suggested name matches what you set in PIPELINE_CACHE_INPUT_PATH)')
         print('  2. In a new run, mount that dataset as Input')
         print('  3. Set BUILD_CACHE_ONLY = False and run again')
         print('=' * 70)

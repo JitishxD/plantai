@@ -3,7 +3,12 @@ tensorflow[and-cuda]==2.21.0
 numpy
 pandas
 scikit-learn
+scikit-image
 matplotlib
 seaborn
 pillow
 kaggle
+opencv-python-headless
+ultralytics
+lime
+# Optional SAM (paper Stage 2): pip install git+https://github.com/facebookresearch/segment-anything.git
