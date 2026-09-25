@@ -1,0 +1,6 @@
+{
+  "img_size": 288,
+  "temperature": 1.1,
+  "threshold": 0.75,
+  "use_tta": true
+}

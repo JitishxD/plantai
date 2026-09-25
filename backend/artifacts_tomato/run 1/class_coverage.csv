@@ -1,11 +1,11 @@
-Class,Field images,PlantDoc test support
-Tomato___Bacterial_spot,85,9
-Tomato___Early_blight,68,9
-Tomato___Late_blight,77,10
-Tomato___Leaf_Mold,73,6
-Tomato___Septoria_leaf_spot,115,11
-Tomato___Spider_mites Two-spotted_spider_mite,2,0
-Tomato___Target_Spot,0,0
-Tomato___Tomato_Yellow_Leaf_Curl_Virus,55,6
-Tomato___Tomato_mosaic_virus,33,10
-Tomato___healthy,45,8
+Class,Lab images,PlantDoc field,Wild field,PlantDoc val support,PlantDoc test support
+Tomato___Bacterial_spot,995,82,992,12,9
+Tomato___Early_blight,1483,60,281,12,9
+Tomato___Late_blight,1569,80,1021,11,10
+Tomato___Leaf_Mold,1547,66,648,10,6
+Tomato___Septoria_leaf_spot,1531,106,874,21,11
+Tomato___Spider_mites Two-spotted_spider_mite,1290,0,0,1,0
+Tomato___Target_Spot,1524,0,0,0,0
+Tomato___Tomato_Yellow_Leaf_Curl_Virus,1344,58,0,5,6
+Tomato___Tomato_mosaic_virus,1356,35,293,8,10
+Tomato___healthy,1843,39,1223,8,8
